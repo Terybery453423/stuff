@@ -1,1 +1,1972 @@
 # stuff
+
+// ==UserScript==
+// @name         E-klase Replacer (Side Menu & SVGs)
+// @namespace    http://tampermonkey.net/
+// @version      11.6
+// @description  Replaces the E-klase UI with a custom one
+// @match        *://*.e-klase.lv/*
+// @run-at       document-start
+// @noframes
+// @grant        GM_xmlhttpRequest
+// @connect      my.e-klase.lv
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    const ctx = { token: null, profileId: null, classId: null, studyYearId: null, studyYearDates: null, username: "", isReady: false };
+    const BASE_URL = 'https://my.e-klase.lv';
+
+    // --- AUTH HARVESTING ---
+    function tryInit() {
+        if (ctx.token && ctx.profileId && ctx.classId && !ctx.isReady) {
+            ctx.isReady = true;
+            console.log("Auth harvested! Initializing...");
+            setTimeout(setupUI, 500);
+        }
+    }
+
+    const captureHeaders = (headers) => {
+        if (!headers) return;
+        let h;
+        try { h = new Headers(headers); } catch (e) { return; }
+        // Token may be refreshed by the site at any time, so keep updating it.
+        if (h.has('Authorization')) ctx.token = h.get('Authorization').replace(/^Bearer\s+/i, '');
+        // Profile/class are only taken before init, so the hidden original app
+        // can't overwrite the profile the user picked in our UI.
+        if (!ctx.isReady) {
+            if (h.has('x-profile-id')) ctx.profileId = h.get('x-profile-id');
+            if (h.has('x-class-id')) ctx.classId = h.get('x-class-id');
+        }
+        tryInit();
+    };
+
+    const origFetch = window.fetch;
+    window.fetch = function(input, init) {
+        if (init && init.headers) captureHeaders(init.headers);
+        else if (input instanceof Request) captureHeaders(input.headers);
+        return origFetch.apply(this, arguments);
+    };
+
+    const origSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
+    XMLHttpRequest.prototype.setRequestHeader = function(key, value) {
+        const k = String(key).toLowerCase();
+        if (k === 'authorization') ctx.token = String(value).replace(/^Bearer\s+/i, '');
+        if (!ctx.isReady) {
+            if (k === 'x-profile-id') ctx.profileId = value;
+            if (k === 'x-class-id') ctx.classId = value;
+        }
+        tryInit();
+        return origSetRequestHeader.apply(this, arguments);
+    };
+
+    // --- API WRAPPER ---
+    let authWarned = false;
+    function api(path, options = {}) {
+        return new Promise((resolve, reject) => {
+            if (!ctx.token) return reject(new Error("No token yet"));
+            const req = {
+                method: options.method || "GET",
+                url: `${BASE_URL}/family/api/${path}`,
+                timeout: 30000,
+                headers: {
+                    'Accept': (options.responseType === 'arraybuffer') ? '*/*' : 'application/json, text/plain, */*',
+                    'Authorization': `Bearer ${ctx.token}`,
+                    'x-profile-id': ctx.profileId,
+                    'x-class-id': ctx.classId,
+                    ...(options.headers || {})
+                },
+                onload: function(response) {
+                    if (response.status >= 200 && response.status < 300) {
+                        if (options.responseType === 'arraybuffer') { resolve(response.response); return; }
+                        if (response.status === 204) { resolve({}); return; }
+                        try { resolve(JSON.parse(response.responseText)); }
+                        catch (e) { resolve(response.responseText); }
+                    } else {
+                        if (response.status === 401 && !authWarned) {
+                            authWarned = true;
+                            toast("Sesija beigusies. Pārlādē lapu.", 'error');
+                        }
+                        try { const errJson = JSON.parse(response.responseText); reject(errJson); }
+                        catch (e) { reject(new Error(`API Error: ${response.status} on ${path}`)); }
+                    }
+                },
+                onerror: function() { reject(new Error("Network Error")); },
+                ontimeout: function() { reject(new Error("Pieprasījums pārsniedza laiku")); }
+            };
+            if (options.isFormData) { req.data = options.body; }
+            else if (options.body) { req.headers['Content-Type'] = 'application/json'; req.data = JSON.stringify(options.body); }
+            if (options.responseType) req.responseType = options.responseType;
+            GM_xmlhttpRequest(req);
+        });
+    }
+
+    // --- CACHING ---
+    const CACHE_PREFIX = 'eklase_v10_';
+    function cacheKey(key) { return `${CACHE_PREFIX}${ctx.profileId}_${key}`; }
+
+    function pruneDiaryCache(aggressive) {
+        try {
+            const prefix = cacheKey('diary_');
+            const keys = [];
+            for (let i = 0; i < localStorage.length; i++) {
+                const k = localStorage.key(i);
+                if (k && k.startsWith(prefix)) keys.push(k);
+            }
+            keys.sort(); // date-sorted, oldest first
+            const keep = aggressive ? 7 : 45;
+            keys.slice(0, Math.max(0, keys.length - keep)).forEach(k => localStorage.removeItem(k));
+        } catch (e) { /* ignore */ }
+    }
+    function saveCache(key, data) {
+        const json = JSON.stringify(data);
+        try { localStorage.setItem(cacheKey(key), json); }
+        catch (e) {
+            pruneDiaryCache(true);
+            try { localStorage.setItem(cacheKey(key), json); }
+            catch (e2) { console.warn("Cache save failed", e2); }
+        }
+        if (key.startsWith('diary_')) pruneDiaryCache(false);
+    }
+    function getCache(key) {
+        try { const val = localStorage.getItem(cacheKey(key)); return val ? JSON.parse(val) : null; }
+        catch (e) { return null; }
+    }
+
+    // --- HELPERS ---
+    const $ = (id) => document.getElementById(id);
+
+    function esc(s) {
+        return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    }
+    function stripHtml(html) { if (!html) return ''; const doc = new DOMParser().parseFromString(html, 'text/html'); return doc.body.textContent || ""; }
+
+    // Cleans server-provided HTML (mail / news bodies) before it is shown.
+    function sanitizeHtml(html) {
+        if (!html) return '';
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+        doc.querySelectorAll('script,style,iframe,object,embed,link,meta,base,form,input,button,textarea,select,svg,math').forEach(n => n.remove());
+        doc.body.querySelectorAll('*').forEach(el => {
+            Array.from(el.attributes).forEach(attr => {
+                const name = attr.name.toLowerCase();
+                const val = attr.value.replace(/\s/g, '').toLowerCase();
+                const badProto = /^(javascript|vbscript):/.test(val) || (/^data:/.test(val) && !(name === 'src' && val.startsWith('data:image/')));
+                if (name.startsWith('on') || name === 'srcdoc' || ((name === 'href' || name === 'src' || name === 'xlink:href') && badProto)) {
+                    el.removeAttribute(attr.name);
+                }
+            });
+            if (el.tagName === 'A' && el.getAttribute('href')) {
+                el.setAttribute('target', '_blank');
+                el.setAttribute('rel', 'noopener noreferrer');
+            }
+        });
+        return doc.body.innerHTML;
+    }
+
+    function safeUrl(u) {
+        try {
+            const url = new URL(u, BASE_URL);
+            return (url.protocol === 'http:' || url.protocol === 'https:') ? url.href : '#';
+        } catch (e) { return '#'; }
+    }
+
+    function toDate(dateStr) { return new Date(/^\d{4}-\d{2}-\d{2}$/.test(dateStr) ? dateStr + 'T12:00:00' : dateStr); }
+    function formatDate(dateStr) { return toDate(dateStr).toLocaleDateString('lv-LV', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }); }
+    function getLocalDateStr(date) { const y = date.getFullYear(); const m = String(date.getMonth() + 1).padStart(2, '0'); const d = String(date.getDate()).padStart(2, '0'); return `${y}-${m}-${d}`; }
+    function formatShortDate(dateStr) { return toDate(dateStr).toLocaleDateString('lv-LV', { day: 'numeric', month: 'short' }); }
+    function getLessonTime(lessonNumber) {
+        if (!lessonNumber || lessonNumber < 1) return "";
+        const startMins = 8 * 60 + (lessonNumber - 1) * 50;
+        const endMins = startMins + 40;
+        const formatMins = (totalMins) => { const h = Math.floor(totalMins / 60).toString().padStart(2, '0'); const m = (totalMins % 60).toString().padStart(2, '0'); return `${h}:${m}`; };
+        return `${formatMins(startMins)}-${formatMins(endMins)}`;
+    }
+
+    function toast(msg, type = 'info') {
+        if (!document.body) return;
+        let box = $('eklase-toast');
+        if (!box) { box = document.createElement('div'); box.id = 'eklase-toast'; document.body.appendChild(box); }
+        const el = document.createElement('div');
+        el.className = `toast ${type}`;
+        el.textContent = msg;
+        box.appendChild(el);
+        setTimeout(() => el.remove(), 3500);
+    }
+
+    function failIfLoading(id) {
+        const el = $(id);
+        if (el && el.textContent.trim().startsWith('Ielādē')) { el.textContent = 'Neizdevās ielādēt datus.'; el.style.color = 'var(--ek-bad)'; }
+    }
+
+    function fetchAndOpenBlob(url) {
+        if (!ctx.token) return toast("Nav autentifikācijas tokena!", 'error');
+        let targetUrl = url;
+        if (url.startsWith('/')) targetUrl = window.location.origin + url;
+        GM_xmlhttpRequest({
+            method: "GET", url: targetUrl,
+            headers: { 'Authorization': `Bearer ${ctx.token}`, 'x-profile-id': ctx.profileId, 'x-class-id': ctx.classId },
+            responseType: 'arraybuffer',
+            timeout: 30000,
+            onload: function(res) {
+                if (res.status >= 200 && res.status < 300) {
+                    const ctMatch = res.responseHeaders.match(/content-type:\s*([^\r\n]+)/i);
+                    let contentType = ctMatch ? ctMatch[1].trim() : 'application/octet-stream';
+                    const blob = new Blob([res.response], { type: contentType });
+                    const blobUrl = URL.createObjectURL(blob);
+                    const w = window.open(blobUrl, '_blank');
+                    if (!w) toast("Pārlūks bloķēja jauno logu.", 'error');
+                    setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
+                } else { toast("Neizdevās atvērt failu. Kļūda: " + res.status, 'error'); }
+            },
+            onerror: () => toast("Neizdevās atvērt failu.", 'error'),
+            ontimeout: () => toast("Neizdevās atvērt failu (laika limits).", 'error')
+        });
+    }
+
+    function downloadAttachment(id, name, linkElement) {
+        if (linkElement.dataset.busy) return;
+        linkElement.dataset.busy = '1';
+        const originalText = linkElement.innerHTML;
+        linkElement.innerHTML = '⏳ Lejupielādē...';
+        api(`attachments/${id}`, { responseType: 'arraybuffer' }).then(buffer => {
+            const blob = new Blob([buffer], { type: 'application/octet-stream' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url; a.download = name;
+            document.body.appendChild(a); a.click(); document.body.removeChild(a);
+            setTimeout(() => URL.revokeObjectURL(url), 10000);
+        }).catch(() => { toast("Kļūda lejupielādējot failu.", 'error'); })
+          .finally(() => { linkElement.innerHTML = originalText; delete linkElement.dataset.busy; });
+    }
+
+    function attLinkHtml(a, style) {
+        return `<a href="#" class="att-link" data-id="${esc(a.id)}" data-name="${esc(a.name)}" style="${style}">📎 ${esc(a.name)} (${Math.round((a.sizeInBytes || 0) / 1024)} KB)</a>`;
+    }
+    function wireAttLinks(container) {
+        container.querySelectorAll('.att-link').forEach(link => {
+            link.addEventListener('click', (e) => { e.preventDefault(); downloadAttachment(link.dataset.id, link.dataset.name, link); });
+        });
+    }
+    function wireBodyLinks(container, selector) {
+        container.querySelectorAll(`${selector} a:not(.att-link)`).forEach(a => {
+            a.addEventListener('click', (e) => {
+                const href = a.getAttribute('href');
+                if (!href || href.startsWith('#') || /^(mailto|tel):/i.test(href)) return;
+                if (/^https?:/i.test(href) && !/e-klase\.lv/i.test(href)) return; // external: opens in new tab
+                e.preventDefault(); fetchAndOpenBlob(href);
+            });
+        });
+    }
+    function setBadge(el, count) {
+        if (!el) return;
+        if (count > 0) { el.textContent = count > 99 ? '99+' : count; el.style.display = 'inline-block'; }
+        else { el.style.display = 'none'; }
+    }
+
+    // --- ICONS ---
+    const ICONS = {
+        home: `<svg viewBox="0 0 24 24"><path d="M20.4037 11.375L12.8556 3.60577C12.4133 3.14423 11.596 3.14423 11.144 3.60577L3.58635 11.375C3.24981 11.7212 3.15366 12.2404 3.33635 12.6827C3.51904 13.1346 3.95173 13.4327 4.44212 13.4327H5.01904V19.5288C5.01904 20.1923 5.5575 20.7404 6.22096 20.7404H9.47096C10.1152 20.7308 10.644 20.1827 10.644 19.5288L10.6921 15.7308L13.3556 15.7885V19.5288C13.3556 20.1923 13.894 20.7308 14.5575 20.7308H17.7979C18.4517 20.7308 18.9902 20.1923 18.9998 19.5192V13.4231H19.5767C20.0575 13.4231 20.4998 13.125 20.6825 12.6731C20.8652 12.2308 20.769 11.7115 20.4325 11.3558L20.4037 11.375Z" fill="currentColor"></path></svg>`,
+        tasks: `<svg viewBox="0 0 16 16"><path d="M13.6964 14.7321L3.85716 14.7321C3.44513 14.7321 3.04997 14.5685 2.75862 14.2771C2.46727 13.9858 2.30359 13.5905 2.30359 13.1785C2.30359 12.7665 2.46727 12.3713 2.75862 12.08C3.04997 11.7886 3.44513 11.625 3.85716 11.625L12.6607 11.625C12.9354 11.625 13.1989 11.5158 13.3931 11.3216C13.5873 11.1274 13.6964 10.8639 13.6964 10.5893L13.6964 2.30354C13.6964 2.02884 13.5873 1.76541 13.3931 1.57118C13.1989 1.37694 12.9354 1.26782 12.6607 1.26782L3.85716 1.26782C3.45221 1.26768 3.0632 1.42566 2.77302 1.70811C2.48282 1.99056 2.31439 2.37516 2.30359 2.77997L2.30359 13.1371" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" fill="none"></path></svg>`,
+        mail: `<svg viewBox="0 0 16 16"><path d="M14.5335 3.15833C14.3168 3.05833 14.0835 3 13.8335 3H2.1668C1.9168 3 1.68346 3.05833 1.4668 3.15833L8.00013 8.875L14.5335 3.15833Z" fill="currentColor"></path><path d="M15.275 3.8418L8.33333 9.9168C8.24167 10.0001 8.125 10.0418 8 10.0418C7.875 10.0418 7.76667 10.0001 7.66667 9.9168L0.725 3.8418C0.583333 4.08346 0.5 4.3668 0.5 4.6668V11.3335C0.5 12.2501 1.25 13.0001 2.16667 13.0001H13.8333C14.75 13.0001 15.5 12.2501 15.5 11.3335V4.6668C15.5 4.3668 15.4167 4.08346 15.275 3.8418Z" fill="currentColor"></path></svg>`,
+        news: `<svg viewBox="0 0 16 16"><path fill-rule="evenodd" clip-rule="evenodd" d="M13.6143 1.63119C13.7483 1.59211 13.8872 1.57227 14.0268 1.57227C14.8404 1.57227 15.5 2.23185 15.5 3.04548V11.8848C15.5 12.6984 14.8404 13.358 14.0268 13.358C13.8872 13.358 13.7483 13.3382 13.6143 13.2991L8.25751 11.7367C8.13122 13.2475 6.86492 14.4343 5.32143 14.4343C3.69416 14.4343 2.375 13.1152 2.375 11.4879V10.0209L1.65714 9.81155C0.971429 9.61155 0.5 8.98298 0.5 8.26869V6.66155C0.5 5.94726 0.971429 5.3187 1.65714 5.11869L13.6143 1.63119ZM3.98214 10.4897V11.4879C3.98214 12.2276 4.58176 12.8272 5.32143 12.8272C6.0611 12.8272 6.66071 12.2276 6.66071 11.4879V11.2709L3.98214 10.4897Z" fill="currentColor"></path></svg>`,
+        stats: `<svg viewBox="6 6 20 20"><path fill-rule="evenodd" clip-rule="evenodd" d="M15.5466 12.024C15.5465 12.0826 15.5581 12.1407 15.5809 12.1949C15.6037 12.2491 15.6371 12.2984 15.6792 12.3399C15.7214 12.3814 15.7715 12.4143 15.8266 12.4367C15.8817 12.4591 15.9407 12.4706 16.0004 12.4706C16.6965 12.4712 17.364 12.7435 17.8563 13.2275C18.3485 13.7116 18.6254 14.3679 18.6262 15.0525C18.6255 15.1115 18.6368 15.1701 18.6593 15.2248C18.6818 15.2795 18.7151 15.3292 18.7573 15.3712C18.7995 15.4132 18.8498 15.4465 18.9052 15.4692C18.9606 15.4919 19.02 15.5036 19.08 15.5036C19.14 15.5036 19.1994 15.4919 19.2548 15.4692C19.3102 15.4465 19.3604 15.4132 19.4026 15.3712C19.4448 15.3292 19.4782 15.2795 19.5007 15.2248C19.5232 15.1701 19.5344 15.1115 19.5338 15.0525C19.5302 14.132 19.1567 13.2502 18.4949 12.5993C17.833 11.9484 16.9364 11.5811 16.0004 11.5774C15.9408 11.5774 15.8817 11.589 15.8266 11.6114C15.7716 11.6339 15.7215 11.6668 15.6794 11.7082C15.6372 11.7497 15.6038 11.7989 15.581 11.8531C15.5582 11.9073 15.5465 11.9654 15.5466 12.024ZM11.0284 15.0525V19.0367H20.9723V15.0525C20.9709 13.9722 20.6064 12.9227 19.9355 12.0674C19.2646 11.212 18.3249 10.5988 17.2627 10.3231L17.3876 10.148C17.565 9.89847 17.6694 9.60589 17.6895 9.30208C17.7096 8.99827 17.6446 8.69486 17.5016 8.42486C17.3585 8.15486 17.1429 7.92861 16.8782 7.77073C16.6135 7.61285 16.3098 7.52938 16.0002 7.52941C15.6906 7.52944 15.3869 7.61296 15.1223 7.7709C14.8576 7.92883 14.642 8.15512 14.499 8.42515C14.356 8.69517 14.2911 8.9986 14.3112 9.3024C14.3314 9.60621 14.4359 9.89876 14.6133 10.1482L14.7375 10.3232C13.6755 10.5989 12.7359 11.2122 12.0651 12.0675C11.3943 12.9229 11.0298 13.9723 11.0284 15.0525ZM16.0004 9.96693C16.1555 9.96694 16.3071 9.92172 16.4361 9.83698C16.5651 9.75225 16.6656 9.63181 16.725 9.49088C16.7844 9.34996 16.7999 9.19489 16.7697 9.04527C16.7395 8.89566 16.6648 8.75822 16.5551 8.65034C16.4455 8.54246 16.3057 8.46898 16.1536 8.43919C16.0015 8.4094 15.8438 8.42464 15.7004 8.48299C15.5571 8.54133 15.4346 8.64016 15.3484 8.76697C15.2622 8.89378 15.2161 9.04288 15.2161 9.19543C15.2162 9.39998 15.2988 9.59613 15.4459 9.74079C15.5929 9.88546 15.7924 9.96679 16.0004 9.96693ZM21.4613 19.9298H10.5391C10.2402 19.9298 9.95354 20.0466 9.74219 20.2544C9.53084 20.4622 9.41211 20.7441 9.41211 21.0381C9.41211 21.332 9.53084 21.6139 9.74219 21.8217C9.95354 22.0295 10.2402 22.1463 10.5391 22.1463H21.4616C21.7605 22.1463 22.0472 22.0295 22.2585 21.8217C22.4698 21.6139 22.5886 21.332 22.5886 21.0381C22.5886 20.7441 22.4698 20.4622 22.2585 20.2544C22.0472 20.0466 21.7605 19.9298 21.4616 19.9298H21.4613ZM17.5843 23.2206L17.6253 23.0394H14.375L14.416 23.2206C14.4961 23.5751 14.6967 23.8922 14.9848 24.1195C15.2728 24.3467 15.6311 24.4706 16.0004 24.4706C16.3697 24.4706 16.7279 24.3467 17.016 24.1195C17.304 23.8922 17.5047 23.5751 17.5847 23.2206H17.5843Z" fill="currentColor"></path></svg>`,
+        links: `<svg viewBox="0 0 16 16" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" fill="none"><path d="M5.92871 10.0716L10.0716 5.92871"></path><path d="M3.89366 6.92773L2.34009 8.48131C0.910073 9.91133 0.910073 12.2299 2.34009 13.6599C3.77012 15.0899 6.08864 15.0899 7.51867 13.6599L9.07224 12.1063"></path><path d="M12.1054 9.07272L13.6589 7.51915C15.089 6.08913 15.089 3.77061 13.6589 2.34058C12.2288 0.910561 9.91035 0.910563 8.48032 2.34058L6.92676 3.89415"></path></svg>`,
+        settings: `<svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.6"></circle><circle cx="12" cy="12" r="1.6"></circle><circle cx="19" cy="12" r="1.6"></circle></svg>`,
+        palette: `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 3a9 9 0 0 0 0 18c.83 0 1.5-.67 1.5-1.5 0-.39-.15-.74-.39-1.01-.23-.26-.38-.61-.38-.99 0-.83.67-1.5 1.5-1.5H16c2.76 0 5-2.24 5-5 0-4.42-4.03-8-9-8zm-5.5 9c-.83 0-1.5-.67-1.5-1.5S5.67 9 6.5 9 8 9.67 8 10.5 7.33 12 6.5 12zm3-4C8.67 8 8 7.33 8 6.5S8.67 5 9.5 5s1.5.67 1.5 1.5S10.33 8 9.5 8zm5 0c-.83 0-1.5-.67-1.5-1.5S13.67 5 14.5 5s1.5.67 1.5 1.5S15.33 8 14.5 8zm3 4c-.83 0-1.5-.67-1.5-1.5S16.67 9 17.5 9s1.5.67 1.5 1.5-.67 1.5-1.5 1.5z"></path></svg>`,
+        chevUp: `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M7.41 15.41 12 10.83l4.59 4.58L18 14l-6-6-6 6z"></path></svg>`,
+        chevDown: `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M7.41 8.59 12 13.17l4.59-4.58L18 10l-6 6-6-6z"></path></svg>`,
+        missed: `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M9.31 17l2.44-2.44L14.19 17l1.06-1.06-2.44-2.44 2.44-2.44L14.19 10l-2.44 2.44L9.31 10l-1.06 1.06 2.44 2.44-2.44 2.44L9.31 17zM19 3h-1V1h-2v2H8V1H6v2H5c-1.11 0-1.99.9-1.99 2L3 19c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 16H5V8h14v11z"></path></svg>`,
+        grades: `<svg viewBox="6 6 20 20" fill="currentColor"><path d="M14.3291 21.5662L13.5713 22.323C13.1141 22.7802 12.2097 23.155 11.5635 23.155H9.41211L9.41309 21.0037C9.41185 20.358 9.78624 19.4531 10.2441 18.9959L11.002 18.239L14.3291 21.5662ZM20.7754 15.117L14.9521 20.9392L11.625 17.6121L17.4482 11.7898L20.7754 15.117ZM16.8242 9.91969C17.2822 9.46247 18.0313 9.46246 18.4893 9.91969L22.2324 13.6638L21.4004 14.4959L17.4482 10.5437L12.457 15.5359L12.249 15.3279C12.0193 15.0982 12.0205 14.7251 12.249 14.4959L16.8242 9.91969ZM23.5303 10.7996V11.7742C23.5303 12.0977 23.3426 12.5504 23.1143 12.7791L22.8555 13.0369L19.5283 9.70973L19.7871 9.45094C20.0162 9.22244 20.4681 9.03493 20.791 9.03493H21.7656L23.5303 10.7996Z" fill="currentColor"></path></svg>`,
+        notes: `<svg viewBox="6 6 20 20" fill="currentColor"><path d="M22.584 12.9403L22.4042 11.9571C22.3795 11.8222 22.262 11.7243 22.1251 11.7243C22.1246 11.7243 22.1243 11.7243 22.1237 11.7243C21.9861 11.7248 21.8691 11.824 21.8455 11.9595L20.2273 21.2827L11.9801 21.283C11.7825 21.283 11.5996 21.2012 11.4647 21.053C11.3101 20.8826 11.224 20.6285 11.2447 20.4108C11.3051 19.886 11.6845 19.505 12.1461 19.505H19.0287C19.167 19.505 19.2853 19.4053 19.3083 19.2687L20.9196 9.74287C20.9335 9.66045 20.9105 9.57618 20.8564 9.51235C20.8027 9.44851 20.7234 9.41177 20.64 9.41177H13.7628C12.1939 9.41177 10.6623 10.6877 10.3484 12.255L8.879 19.4498C8.74678 20.2922 8.95191 21.0841 9.45666 21.68C9.95233 22.2652 10.6791 22.5875 11.5032 22.5875L11.6345 22.5871C11.6371 22.5871 11.6395 22.5872 11.6423 22.5872C12.0813 22.5877 20.4754 22.5882 20.5629 22.5882C20.8806 22.5882 21.1512 22.3607 21.2074 22.0411L22.5853 13.0339C22.5903 13.003 22.5896 12.9711 22.584 12.9403Z" fill="currentColor"></path></svg>`
+    };
+
+    const NAV = [
+        { view: 'home', label: 'Sākums', icon: ICONS.home },
+        { view: 'tasks', label: 'Darbi', icon: ICONS.tasks },
+        { view: 'mail', label: 'Pasts', icon: ICONS.mail, badge: 'mail' },
+        { view: 'news', label: 'Ziņas', icon: ICONS.news, badge: 'news' },
+        { view: 'stats', label: 'Statistika', icon: ICONS.stats },
+        { view: 'links', label: 'Saites', icon: ICONS.links },
+        { view: 'settings', label: 'Iestatījumi', icon: ICONS.settings }
+    ];
+
+    // --- SIDE MENU ORDER & CYCLE ARROWS ---
+    const NAV_ORDER_KEY = 'eklase_nav_order';
+    const NAV_ARROWS_KEY = 'eklase_nav_arrows';
+
+    function loadNavOrder() {
+        const ids = NAV.map(n => n.view);
+        try {
+            const saved = JSON.parse(localStorage.getItem(NAV_ORDER_KEY) || '[]');
+            if (Array.isArray(saved)) {
+                const valid = saved.filter((id, i) => ids.includes(id) && saved.indexOf(id) === i);
+                return [...valid, ...ids.filter(id => !valid.includes(id))];
+            }
+        } catch (e) { /* fall through */ }
+        return ids;
+    }
+    function loadNavArrows() {
+        try { return localStorage.getItem(NAV_ARROWS_KEY) !== '0'; } catch (e) { return true; }
+    }
+    let navOrder = loadNavOrder();
+    let navArrows = loadNavArrows();
+
+    function saveNavOrder() { try { localStorage.setItem(NAV_ORDER_KEY, JSON.stringify(navOrder)); } catch (e) { /* ignore */ } }
+    function saveNavArrows() { try { localStorage.setItem(NAV_ARROWS_KEY, navArrows ? '1' : '0'); } catch (e) { /* ignore */ } }
+
+    // Items removed from the side bar (Settings can never be removed, so there is always a way back).
+    const NAV_HIDDEN_KEY = 'eklase_nav_hidden';
+    function loadNavHidden() {
+        try {
+            const a = JSON.parse(localStorage.getItem(NAV_HIDDEN_KEY) || '[]');
+            if (Array.isArray(a)) return new Set(a.filter(id => id !== 'settings' && NAV.some(n => n.view === id)));
+        } catch (e) { /* fall through */ }
+        return new Set();
+    }
+    let navHidden = loadNavHidden();
+    function saveNavHidden() { try { localStorage.setItem(NAV_HIDDEN_KEY, JSON.stringify([...navHidden])); } catch (e) { /* ignore */ } }
+
+    // Re-orders the existing buttons (so badge counts etc. are kept).
+    function applyNavOrder() {
+        const menu = document.querySelector('.side-menu');
+        const anchor = $('side-bottom');
+        if (!menu || !anchor) return;
+        navOrder.forEach(id => {
+            const btn = menu.querySelector(`.side-item[data-view="${id}"]`);
+            if (btn) { btn.hidden = navHidden.has(id); menu.insertBefore(btn, anchor); }
+        });
+    }
+    function applyNavArrows() {
+        const el = $('side-arrows');
+        if (el) el.hidden = !navArrows;
+    }
+    // dir: -1 = previous menu, 1 = next menu (wraps around)
+    function cycleView(dir) {
+        const active = document.querySelector('.side-item[data-view].active');
+        const n = navOrder.length;
+        const start = Math.max(0, navOrder.indexOf(active ? active.dataset.view : navOrder[0]));
+        for (let k = 1; k <= n; k++) {
+            const id = navOrder[(((start + dir * k) % n) + n) % n];
+            if (!navHidden.has(id)) { switchView(id); return; } // skip removed items
+        }
+    }
+
+    function renderNavSettings() {
+        const c = $('settings-nav');
+        if (!c) return;
+        const last = navOrder.length - 1;
+        const rows = navOrder.map((id, i) => {
+            const n = NAV.find(x => x.view === id);
+            const isHidden = navHidden.has(id);
+            const locked = id === 'settings';
+            return `<div class="nav-row${isHidden ? ' is-hidden' : ''}">
+                <span class="side-icon nav-row-icon">${n.icon}</span>
+                <span class="nav-row-label">${n.label}</span>
+                <button class="icon-btn" data-hide="${id}" ${locked ? 'disabled' : ''} title="${isHidden ? 'Rādīt sānu izvēlnē' : 'Noņemt no sānu izvēlnes'}" aria-label="${isHidden ? 'Rādīt' : 'Noņemt'}: ${n.label}">${isHidden ? '+' : '✕'}</button>
+                <button class="icon-btn" data-move="${i}" data-dir="-1" ${i === 0 ? 'disabled' : ''} aria-label="Uz augšu: ${n.label}">▲</button>
+                <button class="icon-btn" data-move="${i}" data-dir="1" ${i === last ? 'disabled' : ''} aria-label="Uz leju: ${n.label}">▼</button>
+            </div>`;
+        }).join('');
+        c.innerHTML = `<div class="stats-section">
+            <div class="stats-title">Sānu izvēlne</div>
+            ${rows}
+            <div class="toggle-row"><span>Bultiņas izvēlņu pārslēgšanai</span><label class="toggle-switch"><input type="checkbox" id="toggle-nav-arrows" ${navArrows ? 'checked' : ''}><span class="slider"></span></label></div>
+            <div style="margin-top: 10px;"><button id="btn-nav-reset" class="mail-btn">Atiestatīt izvēlni</button></div>
+        </div>
+        <div class="stats-section">
+            <div class="stats-title">Sākuma lapa</div>
+            <div class="toggle-row"><span>Rādīt kavējumus</span><label class="toggle-switch"><input type="checkbox" id="toggle-show-missed" ${showMissed ? 'checked' : ''}><span class="slider"></span></label></div>
+        </div>`;
+        c.querySelectorAll('[data-move]').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const i = parseInt(btn.dataset.move, 10);
+                const j = i + parseInt(btn.dataset.dir, 10);
+                if (j < 0 || j >= navOrder.length) return;
+                [navOrder[i], navOrder[j]] = [navOrder[j], navOrder[i]];
+                saveNavOrder(); applyNavOrder(); renderNavSettings();
+            });
+        });
+        c.querySelectorAll('[data-hide]').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const id = btn.dataset.hide;
+                if (id === 'settings') return;
+                if (navHidden.has(id)) navHidden.delete(id); else navHidden.add(id);
+                saveNavHidden(); applyNavOrder(); renderNavSettings();
+            });
+        });
+        $('toggle-nav-arrows').addEventListener('change', (e) => { navArrows = e.target.checked; saveNavArrows(); applyNavArrows(); });
+        $('toggle-show-missed').addEventListener('change', (e) => { showMissed = e.target.checked; saveShowMissed(); applyMissedVisibility(); });
+        $('btn-nav-reset').addEventListener('click', () => {
+            navOrder = NAV.map(n => n.view);
+            navHidden = new Set();
+            saveNavOrder(); saveNavHidden(); applyNavOrder(); renderNavSettings();
+        });
+    }
+
+    // --- MISSED LESSONS (Kavējumi) SECTION TOGGLE ---
+    const SHOW_MISSED_KEY = 'eklase_show_missed';
+    function loadShowMissed() {
+        try { return localStorage.getItem(SHOW_MISSED_KEY) !== '0'; } catch (e) { return true; }
+    }
+    let showMissed = loadShowMissed();
+    function saveShowMissed() { try { localStorage.setItem(SHOW_MISSED_KEY, showMissed ? '1' : '0'); } catch (e) { /* ignore */ } }
+    function applyMissedVisibility() {
+        const el = $('missed-container');
+        if (el) el.hidden = !showMissed;
+    }
+
+    // --- LOCAL EDITS (grades & disciplinary notes) ---
+    // Display-only: stored in this browser, nothing is sent to E-klase.
+    const EDIT_MODE_KEY = 'eklase_edit_mode';
+    const EDITS_PREFIX = 'eklase_edits_';
+    let editMode = (() => { try { return localStorage.getItem(EDIT_MODE_KEY) === '1'; } catch (e) { return false; } })();
+    let lastGradesData = null;
+    let lastNotesData = null;
+
+    function saveEditMode() { try { localStorage.setItem(EDIT_MODE_KEY, editMode ? '1' : '0'); } catch (e) { /* ignore */ } }
+    function loadEdits() {
+        try {
+            const v = JSON.parse(localStorage.getItem(EDITS_PREFIX + ctx.profileId) || 'null');
+            if (v && typeof v === 'object') return { grades: v.grades || {}, notes: v.notes || {} };
+        } catch (e) { /* fall through */ }
+        return { grades: {}, notes: {} };
+    }
+    function saveEdits(edits) {
+        try { localStorage.setItem(EDITS_PREFIX + ctx.profileId, JSON.stringify(edits)); }
+        catch (e) { toast('Neizdevās saglabāt labojumu.', 'error'); }
+    }
+    function noteKey(n) {
+        const id = n.id ?? n.behaviorEntry?.id;
+        return id != null ? String(id) : `${n.date}|${n.authorName}|${n.text}`;
+    }
+    function noteOrigPos(n) { return n.behaviorEntry?.type === 'positive'; }
+    function clearAllEdits() {
+        const keys = [];
+        try {
+            for (let i = 0; i < localStorage.length; i++) {
+                const k = localStorage.key(i);
+                if (k && k.startsWith(EDITS_PREFIX)) keys.push(k);
+            }
+            keys.forEach(k => localStorage.removeItem(k));
+        } catch (e) { /* ignore */ }
+        return keys.length;
+    }
+    function rerenderEditable() {
+        if (lastGradesData) renderGrades(lastGradesData);
+        if (lastNotesData) renderNotes(lastNotesData);
+    }
+    function setNoteOverride(n, patch) {
+        const key = noteKey(n);
+        const ed = loadEdits();
+        const ov = { ...(ed.notes[key] || {}), ...patch };
+        if (ov.pos === noteOrigPos(n)) delete ov.pos;
+        if (ov.text === (n.text ?? '')) delete ov.text;
+        if (Object.keys(ov).length) ed.notes[key] = ov; else delete ed.notes[key];
+        saveEdits(ed);
+    }
+
+    function openGradeEditor(item) {
+        const container = $('content-grades');
+        if (container.querySelector('.edit-box') || !lastGradesData) return;
+        const gid = item.dataset.gid;
+        const g = (lastGradesData.evaluations || []).find(x => String(x.id) === gid);
+        if (!g) return;
+        const original = String(g.value ?? '');
+        const ov = loadEdits().grades[gid];
+        const current = ov && ov.value != null ? String(ov.value) : original;
+        item.classList.add('editing');
+        const box = document.createElement('div');
+        box.className = 'edit-box';
+        box.innerHTML = `
+            <input type="text" class="compose-input edit-input" maxlength="12" value="${esc(current)}" aria-label="Atzīme">
+            <div class="edit-actions">
+                <button class="btn-send edit-save" type="button">Saglabāt</button>
+                <button class="btn-cancel edit-cancel" type="button">Atcelt</button>
+                ${current !== original ? '<button class="mail-btn edit-restore" type="button">Atjaunot oriģinālu</button>' : ''}
+            </div>
+            <div class="edit-orig">Oriģināls: ${esc(original)}</div>`;
+        item.after(box);
+        const input = box.querySelector('.edit-input');
+        const close = () => { box.remove(); item.classList.remove('editing'); renderGrades(lastGradesData); };
+        const commit = (value) => {
+            const ed = loadEdits();
+            if (value === original) delete ed.grades[gid]; else ed.grades[gid] = { value };
+            saveEdits(ed);
+            close();
+        };
+        box.querySelector('.edit-save').addEventListener('click', () => {
+            const v = input.value.trim();
+            if (!v) return toast('Ievadi atzīmi.', 'error');
+            commit(v);
+        });
+        box.querySelector('.edit-cancel').addEventListener('click', close);
+        const restore = box.querySelector('.edit-restore');
+        if (restore) restore.addEventListener('click', () => commit(original));
+        input.addEventListener('keydown', (e) => { if (e.key === 'Enter') box.querySelector('.edit-save').click(); });
+        box.scrollIntoView({ block: 'nearest' });
+        input.focus(); input.select();
+    }
+    function onGradesClick(e) {
+        if (!editMode || e.target.closest('.edit-box')) return;
+        const item = e.target.closest('.grade-item[data-gid]');
+        if (item && !item.classList.contains('editing')) openGradeEditor(item);
+    }
+
+    function openNoteEditor(item, n) {
+        const container = $('content-notes');
+        if (container.querySelector('.edit-box')) return;
+        const original = String(n.text ?? '');
+        const ov = loadEdits().notes[noteKey(n)] || {};
+        const current = ov.text != null ? String(ov.text) : original;
+        item.classList.add('editing');
+        const box = document.createElement('div');
+        box.className = 'edit-box';
+        box.innerHTML = `
+            <textarea class="compose-textarea edit-input" style="min-height: 80px;" aria-label="Piezīmes teksts">${esc(current)}</textarea>
+            <div class="edit-actions" style="margin-top: 10px;">
+                <button class="btn-send edit-save" type="button">Saglabāt</button>
+                <button class="btn-cancel edit-cancel" type="button">Atcelt</button>
+                ${current !== original ? '<button class="mail-btn edit-restore" type="button">Atjaunot oriģinālu</button>' : ''}
+            </div>
+            <div class="edit-orig">Oriģināls: ${esc(original)}</div>`;
+        item.after(box);
+        const input = box.querySelector('.edit-input');
+        const close = () => { box.remove(); item.classList.remove('editing'); renderNotes(lastNotesData); };
+        box.querySelector('.edit-save').addEventListener('click', () => {
+            const v = input.value.trim();
+            if (!v) return toast('Ievadi tekstu.', 'error');
+            setNoteOverride(n, { text: v });
+            close();
+        });
+        box.querySelector('.edit-cancel').addEventListener('click', close);
+        const restore = box.querySelector('.edit-restore');
+        if (restore) restore.addEventListener('click', () => { setNoteOverride(n, { text: original }); close(); });
+        box.scrollIntoView({ block: 'nearest' });
+        input.focus();
+    }
+    function onNotesClick(e) {
+        if (!editMode || e.target.closest('.edit-box') || !lastNotesData) return;
+        const item = e.target.closest('.note-item[data-nkey]');
+        if (!item || item.classList.contains('editing')) return;
+        const n = lastNotesData.find(x => noteKey(x) === item.dataset.nkey);
+        if (!n) return;
+        if (e.target.closest('.note-flip')) {
+            // one tap: pozitīvs <-> negatīvs
+            const ov = loadEdits().notes[noteKey(n)] || {};
+            const curPos = ov.pos != null ? !!ov.pos : noteOrigPos(n);
+            setNoteOverride(n, { pos: !curPos });
+            renderNotes(lastNotesData);
+        } else if (e.target.closest('.note-text')) {
+            openNoteEditor(item, n);
+        }
+    }
+
+    function renderEditSettings() {
+        const c = $('settings-edit');
+        if (!c) return;
+        c.innerHTML = `<div class="stats-section">
+            <div class="stats-title">Rediģēšana</div>
+            <div class="toggle-row"><span>Labot atzīmes un piezīmes</span><label class="toggle-switch"><input type="checkbox" id="toggle-edit-mode" ${editMode ? 'checked' : ''}><span class="slider"></span></label></div>
+            <div style="font-size: 0.85em; color: var(--ek-muted); margin-top: 8px; line-height: 1.4;">Kad ieslēgts, uz atzīmes vai piezīmes var piespiest, lai to labotu. Labotie ieraksti ir atzīmēti ar ✎. Labojumi tiek saglabāti tikai šajā ierīcē, E-klase netiek mainīta.</div>
+            <div style="margin-top: 10px;"><button id="btn-edits-reset" class="mail-btn danger">Atiestatīt labojumus</button></div>
+        </div>`;
+        $('toggle-edit-mode').addEventListener('change', (e) => {
+            editMode = e.target.checked; saveEditMode(); rerenderEditable();
+        });
+        $('btn-edits-reset').addEventListener('click', () => {
+            if (!confirm('Vai atiestatīt visus labojumus?')) return;
+            const n = clearAllEdits();
+            rerenderEditable();
+            toast(n ? 'Labojumi atiestatīti' : 'Nav labojumu', n ? 'ok' : 'info');
+        });
+    }
+
+    // --- THEMES ---
+    const THEME_BASE = {
+        bg: '#1a1a1a', surface: '#222', surface2: '#2a2a2a', soft: '#333', line: '#444', line2: '#555',
+        text: '#fff', text2: '#ccc', dim: '#a4b0be', muted: '#888', hw: '#353b48',
+        accent: '#74b9ff', link: '#00a8ff', good: '#2ed573', bad: '#ff4757', warn: '#f1c40f', gold: '#e1b12c',
+        orange: '#ffa502', purple: '#9b59b6', info: '#0984e3', 'on-accent': '#000', scheme: 'dark'
+    };
+    // Each theme only lists what differs from THEME_BASE (the original dark look).
+    const THEMES = {
+        dark: { name: 'Dark', vars: {} },
+        oled: { name: 'OLED', vars: {
+            bg: '#000', surface: '#0a0a0a', surface2: '#141414', soft: '#1e1e1e', line: '#2c2c2c', line2: '#3c3c3c',
+            text2: '#d0d0d0', muted: '#777', hw: '#1b1f27'
+        } },
+        crimson: { name: 'Crimson', vars: {
+            bg: '#150a0d', surface: '#1f1115', surface2: '#29161b', soft: '#37212a', line: '#4f2b35', line2: '#653a47',
+            text: '#fbeff1', text2: '#e0c7cc', dim: '#c3a2a9', muted: '#94767d', hw: '#3a1f27',
+            accent: '#f2566d', link: '#ff8aa0', info: '#b5283c', 'on-accent': '#1a0509'
+        } },
+        purple: { name: 'Purple', vars: {
+            bg: '#130d1f', surface: '#1a1230', surface2: '#231a3d', soft: '#2d2250', line: '#3d3066', line2: '#4f407f',
+            text: '#f3effb', text2: '#d4c9ec', dim: '#b3a6cf', muted: '#8678a6', hw: '#2b2150',
+            accent: '#b392f0', link: '#c3a9ff', info: '#7c4dcc', 'on-accent': '#1b1030'
+        } },
+        light: { name: 'Light', vars: {
+            bg: '#eceff3', surface: '#ffffff', surface2: '#f5f6f8', soft: '#e4e8ee', line: '#d3d9e1', line2: '#bcc5d0',
+            text: '#1b2330', text2: '#3c4756', dim: '#5a6676', muted: '#7a8696', hw: '#fff4d6',
+            accent: '#1f6fd1', link: '#0a66c2', good: '#1e9e57', bad: '#d63447', warn: '#b7860b', gold: '#a8780a',
+            orange: '#c26a00', purple: '#7b3fa0', info: '#1f6fd1', 'on-accent': '#fff', scheme: 'light'
+        } },
+        blue: { name: 'Blue', vars: {
+            bg: '#0f1722', surface: '#141e2c', surface2: '#1a2638', soft: '#243348', line: '#304259', line2: '#40536f',
+            text: '#e4ebf5', text2: '#c1ccdb', dim: '#9aabc1', muted: '#71849d', hw: '#202f46',
+            accent: '#6a9bd4', link: '#7fb1e6', info: '#3b6ea8', 'on-accent': '#0b1320'
+        } }
+    };
+
+    function themeCss() {
+        const decl = (v) => Object.entries(v).map(([k, val]) => `--ek-${k}: ${val};`).join(' ');
+        let css = `html { ${decl(THEME_BASE)} }\n`;
+        Object.entries(THEMES).forEach(([id, t]) => {
+            if (Object.keys(t.vars).length) css += `html[data-eklase-theme="${id}"] { ${decl(t.vars)} }\n`;
+        });
+        return css;
+    }
+    function getSavedTheme() {
+        try { return localStorage.getItem('eklase_theme') || 'dark'; } catch (e) { return 'dark'; }
+    }
+    function applyTheme(id) {
+        if (!THEMES[id]) id = 'dark';
+        document.documentElement.setAttribute('data-eklase-theme', id);
+        try { localStorage.setItem('eklase_theme', id); } catch (e) { /* ignore */ }
+        document.querySelectorAll('.theme-option').forEach(b => b.classList.toggle('active', b.dataset.theme === id));
+        // Make the browser's address/status bar match the theme
+        try {
+            let meta = document.querySelector('meta[name="theme-color"]');
+            if (!meta) { meta = document.createElement('meta'); meta.name = 'theme-color'; document.head.appendChild(meta); }
+            meta.content = { ...THEME_BASE, ...THEMES[id].vars }.bg;
+        } catch (e) { /* ignore */ }
+    }
+
+    // --- UI SETUP & STATE ---
+    let currentDate = new Date();
+    let appContainer = null;
+    let lastRefresh = Date.now();
+
+    function switchView(viewId) {
+        const btn = document.querySelector(`.side-item[data-view="${viewId}"]`);
+        const view = $(`view-${viewId}`);
+        if (!btn || !view) return;
+        document.querySelectorAll('.side-item[data-view]').forEach(b => b.classList.remove('active'));
+        document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+        btn.classList.add('active');
+        view.classList.add('active');
+        if (appContainer) appContainer.scrollTop = 0;
+        if (viewId === 'home') requestAnimationFrame(applyLessonCollapse);
+    }
+
+    function setupUI() {
+        if (appContainer) return;
+        if (!document.body) { document.addEventListener('DOMContentLoaded', setupUI, { once: true }); return; }
+
+        const style = document.createElement('style');
+        style.textContent = themeCss() + `
+            #my-custom-eklase {
+                position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; height: 100dvh;
+                background: var(--ek-bg); color: var(--ek-text); z-index: 9999999;
+                font-family: system-ui, -apple-system, sans-serif;
+                font-size: 13px;
+                box-sizing: border-box;
+                overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior: contain;
+                -webkit-text-size-adjust: 100%;
+                color-scheme: var(--ek-scheme);
+                -webkit-tap-highlight-color: transparent;
+                padding-right: 60px;
+            }
+            #my-custom-eklase button:focus-visible, #my-custom-eklase select:focus-visible,
+            #my-custom-eklase input:focus-visible, #my-custom-eklase summary:focus-visible { outline: 2px solid var(--ek-accent); outline-offset: 2px; }
+            body > #root, body > app-root, body > #app, body > #app-root { display: none !important; }
+
+            /* --- SIDE MENU (fixed width, never expands) --- */
+            .side-menu {
+                position: fixed; right: 0; top: 0; height: 100vh; height: 100dvh; width: 60px;
+                background: var(--ek-surface); border-left: 1px solid var(--ek-line);
+                z-index: 10000;
+                display: flex; flex-direction: column;
+                overflow-y: auto; scrollbar-width: none;
+                padding-top: 15px;
+                box-sizing: border-box;
+            }
+            .side-menu::-webkit-scrollbar { display: none; }
+
+            .side-item {
+                position: relative;
+                display: flex; align-items: center; justify-content: center;
+                padding: 14px 0; width: 100%; flex-shrink: 0; box-sizing: border-box;
+                background: none; border: none; color: var(--ek-muted);
+                cursor: pointer;
+                transition: 0.15s;
+                border-left: 3px solid transparent;
+                border-right: 3px solid transparent;
+            }
+            .side-item:hover { background: var(--ek-surface2); color: var(--ek-text); }
+            .side-item.active { color: var(--ek-accent); background: var(--ek-surface2); border-left-color: var(--ek-accent); }
+
+            .side-icon { width: 24px; height: 24px; min-width: 24px; display: flex; justify-content: center; align-items: center; }
+            .side-icon svg { width: 100%; height: 100%; fill: currentColor; }
+
+            .side-badge {
+                position: absolute; top: 5px; right: 4px;
+                min-width: 16px; height: 16px; padding: 0 4px; box-sizing: border-box;
+                background: var(--ek-bad); color: white; border-radius: 8px;
+                font-size: 10px; font-weight: bold; line-height: 16px; text-align: center;
+                display: none; pointer-events: none;
+            }
+            @media (max-height: 460px) { .side-item { padding: 8px 0; } .side-menu { padding-top: 6px; } }
+
+            /* --- MAIN AREA --- */
+            .main-content {
+                max-width: 800px; width: 100%; margin: 0 auto; padding: 20px;
+                padding-bottom: 100px; box-sizing: border-box;
+            }
+            .header-bar { display: flex; justify-content: space-between; align-items: center; gap: 10px; border-bottom: 1px solid var(--ek-soft); padding-bottom: 10px; margin-bottom: 15px; }
+            .header-bar h1 { margin: 0; font-size: 1.4em; }
+            .header-actions { display: flex; align-items: center; gap: 8px; }
+            .icon-btn { background: var(--ek-surface2); color: var(--ek-text2); border: 1px solid var(--ek-line); border-radius: 6px; width: 34px; height: 30px; cursor: pointer; font-size: 1.1em; }
+            .icon-btn:hover { background: var(--ek-soft); color: var(--ek-text); }
+            .icon-btn.spin { animation: spin 0.8s linear infinite; }
+            @keyframes spin { to { transform: rotate(360deg); } }
+
+            .profile-wrapper { margin-bottom: 15px; display: flex; gap: 10px; }
+            .profile-select { flex: 1; background: var(--ek-surface2); color: var(--ek-text); border: 1px solid var(--ek-line); padding: 8px 12px; border-radius: 6px; font-size: 13px; font-weight: bold; cursor: pointer; outline: none; min-width: 0; }
+
+            /* --- VIEWS --- */
+            .view { display: none; }
+            .view.active { display: block; animation: fadeIn 0.15s; }
+            @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+
+            /* --- ACCORDIONS (main page) --- */
+            .tab-container { background: var(--ek-surface); border: 1px solid var(--ek-line); border-radius: 6px; margin-bottom: 10px; overflow: hidden; }
+            .tab-container summary { padding: 10px 15px; font-weight: bold; cursor: pointer; font-size: 1.1em; user-select: none; display: flex; align-items: center; list-style: none; }
+            .tab-container summary::-webkit-details-marker { display: none; }
+            .tab-container[open] summary { border-bottom: 1px solid var(--ek-line); background: var(--ek-surface2); }
+            .tab-content { padding: 10px 15px; max-height: 400px; overflow-y: auto; overscroll-behavior: contain; }
+
+            .tab-container[hidden] { display: none; }
+            .side-item[hidden] { display: none; }
+            .nav-row.is-hidden .nav-row-label, .nav-row.is-hidden .nav-row-icon { opacity: 0.4; }
+
+            /* --- LOCAL EDITING --- */
+            .edited-mark { color: var(--ek-muted); font-size: 0.85em; margin-left: 5px; font-weight: normal; }
+            .grade-item.editable { cursor: pointer; background: color-mix(in srgb, var(--ek-accent) 8%, transparent); border-radius: 4px; padding-left: 6px; padding-right: 6px; }
+            .note-text.editable-text { cursor: pointer; text-decoration: underline dashed; text-underline-offset: 3px; }
+            .note-edit-row { display: flex; align-items: center; gap: 8px; margin: 4px 0 6px; }
+            .chip-btn { background: var(--ek-surface2); color: var(--ek-text); border: 1px solid var(--ek-line); border-radius: 12px; padding: 4px 12px; font-size: 0.9em; cursor: pointer; }
+            .chip-hint { font-size: 0.75em; color: var(--ek-muted); }
+            .edit-box { background: var(--ek-surface2); border: 1px solid var(--ek-accent); border-radius: 8px; padding: 10px; margin: 6px 0 10px; }
+            .edit-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+            .edit-actions .btn-cancel { margin-left: 0; }
+            .edit-orig { font-size: 0.8em; color: var(--ek-muted); margin-top: 8px; overflow-wrap: anywhere; }
+            #settings-edit { border-top: 1px solid var(--ek-soft); padding-top: 15px; margin-top: 5px; }
+            .badge { background: var(--ek-bad); color: white; border-radius: 12px; padding: 2px 8px; font-size: 0.85em; margin-left: 10px; display: none; }
+
+            /* --- GRADES & NOTES --- */
+            .grade-item { display: flex; justify-content: space-between; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--ek-soft); }
+            .grade-item:last-child { border-bottom: none; }
+            .date-label { font-weight: bold; color: var(--ek-accent); font-size: 0.9em; margin-bottom: 3px; }
+            .entered-label { color: var(--ek-muted); font-size: 0.85em; font-weight: normal; margin-left: 5px; }
+            .grade-val { font-weight: bold; font-size: 1.2em; color: var(--ek-good); min-width: 40px; text-align: right; }
+            .grade-val.percent { color: var(--ek-gold); font-size: 1em; line-height: 1.5em; }
+            .note-item { padding: 8px 0; border-bottom: 1px solid var(--ek-soft); }
+            .note-item:last-child { border-bottom: none; }
+            .note-pos { color: var(--ek-good); }
+            .note-neg { color: var(--ek-bad); }
+
+            /* --- MAIL --- */
+            .mail-item { border-bottom: 1px solid var(--ek-soft); padding: 10px 0; }
+            .mail-item:last-child { border-bottom: none; }
+            .mail-item summary { cursor: pointer; display: flex; justify-content: space-between; align-items: flex-start; list-style: none; outline: none; }
+            .mail-item summary::-webkit-details-marker { display: none; }
+            .mail-subject { font-size: 1.05em; margin-bottom: 3px; }
+            .mail-meta { font-size: 0.85em; color: var(--ek-muted); }
+            .mail-body, .news-body { word-wrap: break-word; overflow-wrap: anywhere; overflow-x: auto; }
+            .mail-body { margin-top: 10px; padding: 12px; background: var(--ek-surface2); border-radius: 4px; font-size: 0.95em; line-height: 1.5; color: var(--ek-text2); }
+            .mail-body a, .news-body a { color: var(--ek-link); text-decoration: underline; cursor: pointer; }
+            .mail-body img, .news-body img { max-width: 100%; height: auto; }
+            .mail-body table, .news-body table { max-width: 100%; }
+            .mail-body p, .news-body p { margin: 0 0 8px; }
+            .unread-dot { background: var(--ek-bad); width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-top: 6px; flex-shrink: 0; }
+            .mail-actions { display: flex; gap: 5px; margin-top: 10px; flex-wrap: wrap; }
+            .mail-btn { background: var(--ek-soft); color: var(--ek-text); border: 1px solid var(--ek-line2); padding: 6px 10px; border-radius: 4px; cursor: pointer; font-size: 0.8em; }
+            .mail-btn:hover { background: var(--ek-line); }
+            .mail-btn.danger { color: var(--ek-bad); border-color: var(--ek-bad); }
+
+            /* --- NEWS --- */
+            .news-item { padding: 10px 0; border-bottom: 1px solid var(--ek-soft); }
+            .news-item:last-child { border-bottom: none; }
+            .news-title { font-weight: bold; font-size: 1.05em; margin-bottom: 5px; }
+            .news-body { font-size: 0.95em; color: var(--ek-text2); line-height: 1.5; margin-bottom: 10px; }
+
+            /* --- STATS --- */
+            .stats-section { margin-bottom: 15px; }
+            .stats-title { font-weight: bold; color: var(--ek-accent); margin-bottom: 8px; font-size: 1.05em; }
+            .stats-grid { display: grid; grid-template-columns: 1fr 60px 60px; gap: 8px; align-items: center; padding: 6px 0; border-bottom: 1px solid var(--ek-soft); font-size: 0.9em; }
+            .stats-header { font-weight: bold; color: var(--ek-muted); border-bottom: 2px solid var(--ek-line); }
+            .stats-val { text-align: center; font-weight: bold; }
+            .stats-pos { color: var(--ek-good); }
+            .stats-warn { color: var(--ek-warn); }
+            .stats-neg { color: var(--ek-bad); }
+            .excuse-item { background: var(--ek-surface2); padding: 10px; border-radius: 4px; margin-bottom: 8px; }
+            .excuse-date { font-weight: bold; color: var(--ek-gold); font-size: 0.9em; margin-bottom: 3px; }
+            .excuse-note { font-size: 0.95em; margin-bottom: 4px; }
+            .excuse-meta { font-size: 0.8em; color: var(--ek-muted); }
+
+            /* --- LINKS --- */
+            .links-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 10px; }
+            .link-card { background: var(--ek-surface2); padding: 12px; border-radius: 6px; text-decoration: none; color: var(--ek-text); border: 1px solid var(--ek-line); display: flex; flex-direction: column; transition: 0.2s; }
+            .link-card:hover { border-color: var(--ek-accent); background: var(--ek-soft); }
+            .link-name { font-weight: bold; color: var(--ek-accent); margin-bottom: 4px; }
+            .link-url { font-size: 0.8em; color: var(--ek-muted); word-break: break-all; }
+
+            /* --- SETTINGS --- */
+            .toggle-row { display: flex; justify-content: space-between; align-items: center; padding: 8px 0; border-bottom: 1px solid var(--ek-soft); }
+            .toggle-row:last-child { border-bottom: none; }
+            .toggle-switch { position: relative; display: inline-block; width: 40px; height: 20px; }
+            .toggle-switch input { opacity: 0; width: 0; height: 0; }
+            .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: var(--ek-line); transition: .4s; border-radius: 20px; }
+            .slider:before { position: absolute; content: ""; height: 16px; width: 16px; left: 2px; bottom: 2px; background-color: white; transition: .4s; border-radius: 50%; }
+            input:checked + .slider { background-color: var(--ek-good); }
+            input:checked + .slider:before { transform: translateX(20px); }
+
+            /* --- DIARY --- */
+            .day-nav { display: flex; align-items: center; justify-content: center; gap: 15px; margin-bottom: 15px; margin-top: 20px; }
+            .nav-btn { background: var(--ek-surface2); color: var(--ek-text); border: 1px solid var(--ek-line); border-radius: 5px; padding: 8px 16px; font-size: 1.1em; cursor: pointer; }
+            .nav-btn:hover { background: var(--ek-soft); }
+            .today-row { text-align: center; margin: -6px 0 14px; }
+            .today-row[hidden] { display: none; }
+            .today-btn { background: transparent; color: var(--ek-accent); border: 1px solid color-mix(in srgb, var(--ek-accent) 35%, transparent); border-radius: 12px; padding: 3px 12px; font-size: 0.85em; cursor: pointer; }
+            .date-display { position: relative; cursor: pointer; padding: 5px 10px; border-radius: 5px; }
+            .date-display:hover { background: var(--ek-surface2); }
+            .date-display span { display: inline-block; font-size: 1.1em; font-weight: bold; color: var(--ek-accent); }
+            .date-display span::first-letter { text-transform: uppercase; }
+            .date-display input { position: absolute; top: 0; left: 0; opacity: 0; width: 100%; height: 100%; cursor: pointer; }
+            .diary-card { background: var(--ek-surface2); border-radius: 8px; padding: 15px; }
+            .lesson-item { margin-bottom: 12px; border-bottom: 1px solid var(--ek-line); padding-bottom: 10px; }
+            .lesson-item:last-child { border-bottom: none; margin-bottom: 0; padding-bottom: 0; }
+            .lesson-title { font-weight: bold; font-size: 1.1em; color: var(--ek-text); margin-bottom: 5px; display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px; }
+            .lesson-item.lesson-now { border-left: 3px solid var(--ek-accent); padding-left: 10px; }
+            .now-tag { font-size: 0.7em; font-weight: bold; color: var(--ek-accent); border: 1px solid var(--ek-accent); border-radius: 10px; padding: 0 7px; }
+            .lesson-time { font-weight: normal; font-size: 0.85em; color: var(--ek-muted); }
+            .lesson-canceled { opacity: 0.6; font-style: italic; color: var(--ek-dim); }
+            .pre-line { white-space: pre-line; overflow-wrap: anywhere; }
+            .hw-box { background: var(--ek-hw); padding: 10px; border-radius: 4px; margin-top: 8px; border-left: 3px solid var(--ek-gold); overflow-wrap: anywhere; }
+            .test-box { color: var(--ek-orange); margin-top: 8px; background: rgba(255,165,2,0.1); padding: 8px; border-radius: 4px; overflow-wrap: anywhere; }
+
+            /* --- TASKS --- */
+            .task-item { background: var(--ek-surface2); padding: 12px; border-radius: 6px; margin-bottom: 10px; border-left: 4px solid var(--ek-line); }
+            .task-item.today { border-left-color: var(--ek-good); }
+            .task-item.tomorrow { border-left-color: var(--ek-warn); }
+            .task-item.overdue { border-left-color: var(--ek-bad); }
+            .task-header { display: flex; justify-content: space-between; margin-bottom: 5px; }
+            .task-date { font-weight: bold; font-size: 0.9em; color: var(--ek-accent); }
+            .task-type { font-size: 0.75em; background: var(--ek-line); padding: 2px 6px; border-radius: 4px; font-weight: bold; }
+            .task-subject { font-weight: bold; font-size: 1.05em; margin-bottom: 5px; }
+            .task-desc { font-size: 0.95em; color: var(--ek-text2); line-height: 1.4; white-space: pre-line; overflow-wrap: anywhere; }
+            .task-meta { font-size: 0.85em; color: var(--ek-muted); margin-top: 5px; }
+
+            /* --- COMPOSER --- */
+            .compose-form { background: var(--ek-surface2); padding: 15px; border-radius: 8px; border: 1px solid var(--ek-line); }
+            .compose-input { width: 100%; box-sizing: border-box; background: var(--ek-bg); border: 1px solid var(--ek-line); color: var(--ek-text); padding: 10px; border-radius: 4px; margin-bottom: 10px; font-family: inherit; font-size: inherit; }
+            .compose-textarea { width: 100%; box-sizing: border-box; background: var(--ek-bg); border: 1px solid var(--ek-line); color: var(--ek-text); padding: 10px; border-radius: 4px; min-height: 120px; font-family: inherit; font-size: inherit; resize: vertical; }
+            .recipient-picker { display: flex; gap: 10px; margin-bottom: 10px; }
+            .compose-select { background: var(--ek-bg); color: var(--ek-text); border: 1px solid var(--ek-line); padding: 8px; border-radius: 4px; flex: 1; min-width: 0; }
+            .selected-recipients { display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 10px; }
+            .recipient-tag { background: var(--ek-info); color: white; padding: 4px 8px; border-radius: 12px; font-size: 0.85em; display: flex; align-items: center; gap: 6px; }
+            .recipient-tag span { cursor: pointer; font-weight: bold; padding: 0 4px; }
+            .attachment-list { margin-bottom: 10px; }
+            .attachment-item { font-size: 0.85em; color: var(--ek-link); display: flex; justify-content: space-between; background: var(--ek-bg); padding: 5px 10px; border-radius: 4px; margin-bottom: 5px; }
+            .attachment-item span { color: var(--ek-bad); cursor: pointer; font-weight: bold; padding: 0 8px; }
+            .btn-send { background: var(--ek-good); color: #000; border: none; padding: 10px 20px; border-radius: 4px; font-weight: bold; cursor: pointer; }
+            .btn-send:disabled { opacity: 0.6; }
+            .btn-cancel { background: transparent; color: var(--ek-bad); border: 1px solid var(--ek-bad); padding: 9px 20px; border-radius: 4px; font-weight: bold; cursor: pointer; margin-left: 10px; }
+            .btn-attach { background: var(--ek-hw); color: var(--ek-text); border: none; padding: 8px 12px; border-radius: 4px; cursor: pointer; margin-right: 10px; }
+
+            /* --- THEME BUTTON & MENU --- */
+            .side-bottom { margin-top: auto; margin-bottom: 10px; display: flex; flex-direction: column; flex-shrink: 0; }
+            #btn-theme.active { border-left-color: transparent; }
+            .side-arrows { display: flex; flex-direction: column; }
+            .side-arrows[hidden] { display: none; }
+            .side-arrow { padding: 8px 0; }
+            .side-arrow .side-icon { width: 22px; height: 22px; min-width: 22px; }
+
+            /* --- SIDE MENU SETTINGS --- */
+            #settings-nav { border-bottom: 1px solid var(--ek-soft); margin-bottom: 15px; padding-bottom: 5px; }
+            .nav-row { display: flex; align-items: center; gap: 10px; padding: 6px 0; border-bottom: 1px solid var(--ek-soft); }
+            .nav-row-icon { color: var(--ek-muted); width: 20px; height: 20px; min-width: 20px; }
+            .nav-row-label { flex: 1; }
+            .icon-btn:disabled { opacity: 0.3; cursor: default; }
+            .theme-menu { position: fixed; right: 68px; bottom: 12px; z-index: 10001; background: var(--ek-surface); border: 1px solid var(--ek-line); border-radius: 10px; padding: 8px; display: flex; flex-direction: column; gap: 4px; min-width: 150px; max-height: calc(100vh - 24px); max-height: calc(100dvh - 24px); overflow-y: auto; box-shadow: 0 6px 20px rgba(0,0,0,0.45); }
+            .theme-menu[hidden] { display: none; }
+            .theme-title { font-weight: bold; color: var(--ek-muted); font-size: 0.8em; padding: 4px 8px; text-transform: uppercase; letter-spacing: 0.05em; }
+            .theme-option { display: flex; align-items: center; gap: 10px; background: none; border: 1px solid transparent; color: var(--ek-text); padding: 8px 10px; border-radius: 8px; cursor: pointer; font-size: 1em; text-align: left; }
+            .theme-option:hover { background: var(--ek-surface2); }
+            .theme-option.active { border-color: var(--ek-accent); }
+            .theme-swatch { width: 34px; height: 22px; border-radius: 6px; border: 1px solid; display: flex; align-items: center; justify-content: flex-end; gap: 3px; padding: 0 4px; box-sizing: border-box; flex-shrink: 0; }
+            .theme-swatch i { width: 8px; height: 8px; border-radius: 50%; display: block; }
+            .theme-check { margin-left: auto; color: var(--ek-accent); visibility: hidden; }
+            .theme-option.active .theme-check { visibility: visible; }
+
+            /* --- COLLAPSIBLE LESSONS --- */
+            .lesson-item.collapsible { cursor: pointer; }
+            .lesson-item.collapsible.collapsed .lesson-body { max-height: 100px; overflow: hidden; position: relative; }
+            .lesson-item.collapsible.collapsed .lesson-body::after { content: ''; position: absolute; left: 0; right: 0; bottom: 0; height: 40px; background: linear-gradient(to bottom, transparent, var(--ek-surface2)); pointer-events: none; }
+            .lesson-more { font-size: 0.8em; color: var(--ek-accent); margin-top: 6px; user-select: none; }
+
+            /* --- TOAST --- */
+            #eklase-toast { position: fixed; left: 0; right: 60px; bottom: 20px; display: flex; flex-direction: column; align-items: center; gap: 8px; z-index: 10000001; pointer-events: none; }
+            #eklase-toast .toast { background: var(--ek-soft); color: var(--ek-text); border: 1px solid var(--ek-line2); padding: 10px 16px; border-radius: 8px; font: 13px system-ui, -apple-system, sans-serif; max-width: 90%; box-shadow: 0 4px 14px rgba(0,0,0,0.4); animation: fadeIn 0.15s; }
+            #eklase-toast .toast.error { border-color: var(--ek-bad); }
+            #eklase-toast .toast.ok { border-color: var(--ek-good); }
+        `;
+        document.head.appendChild(style);
+
+        appContainer = document.createElement('div');
+        appContainer.id = 'my-custom-eklase';
+
+        const sideMenuHtml = NAV.map((n, i) => `
+                <button class="side-item${i === 0 ? ' active' : ''}" data-view="${n.view}" title="${n.label}" aria-label="${n.label}">
+                    <span class="side-icon">${n.icon}</span>
+                    ${n.badge ? `<span id="side-badge-${n.badge}" class="side-badge"></span>` : ''}
+                </button>`).join('');
+
+        const themeMenuHtml = `<div id="theme-menu" class="theme-menu" hidden>
+                <div class="theme-title">Themes</div>
+                ${Object.entries(THEMES).map(([id, t]) => {
+                    const v = { ...THEME_BASE, ...t.vars };
+                    return `<button class="theme-option" data-theme="${id}">
+                        <span class="theme-swatch" style="background: ${v.bg}; border-color: ${v.line2};"><i style="background: ${v.surface2};"></i><i style="background: ${v.accent};"></i></span>
+                        <span>${t.name}</span><span class="theme-check">✓</span>
+                    </button>`;
+                }).join('')}
+            </div>`;
+
+        appContainer.innerHTML = `
+            <!-- RIGHT SIDE MENU -->
+            <div class="side-menu">${sideMenuHtml}
+                <div id="side-bottom" class="side-bottom">
+                    <div id="side-arrows" class="side-arrows">
+                        <button id="btn-nav-up" class="side-item side-arrow" title="Iepriekšējā izvēlne" aria-label="Iepriekšējā izvēlne"><span class="side-icon">${ICONS.chevUp}</span></button>
+                        <button id="btn-nav-down" class="side-item side-arrow" title="Nākamā izvēlne" aria-label="Nākamā izvēlne"><span class="side-icon">${ICONS.chevDown}</span></button>
+                    </div>
+                    <button id="btn-theme" class="side-item" title="Themes" aria-label="Themes">
+                        <span class="side-icon">${ICONS.palette}</span>
+                    </button>
+                </div>
+            </div>
+            ${themeMenuHtml}
+
+            <!-- MAIN CONTENT -->
+            <div class="main-content">
+                <!-- HOME VIEW -->
+                <div id="view-home" class="view active">
+                    <div class="header-bar">
+                        <h1>My E-klase</h1>
+                        <div class="header-actions">
+                            <div id="mail-badge-top" style="background: var(--ek-bad); padding: 4px 12px; border-radius: 15px; font-weight: bold; display: none;">Mail: 0</div>
+                            <button id="btn-refresh" class="icon-btn" title="Atjaunot" aria-label="Atjaunot">&#8635;</button>
+                        </div>
+                    </div>
+
+                    <div class="profile-wrapper">
+                        <select id="profile-select" class="profile-select" disabled><option>Ielādē profilus...</option></select>
+                    </div>
+
+                    <details class="tab-container">
+                        <summary>
+                            <span class="side-icon" style="margin-right: 10px; width: 20px; height: 20px;">${ICONS.grades}</span>
+                            Atzīmes <span id="badge-grades" class="badge">0</span>
+                        </summary>
+                        <div id="content-grades" class="tab-content" style="color: var(--ek-dim);">Ielādē atzīmes...</div>
+                    </details>
+
+                    <details class="tab-container">
+                        <summary>
+                            <span class="side-icon" style="margin-right: 10px; width: 20px; height: 20px;">${ICONS.notes}</span>
+                            Piezīmes <span id="badge-notes" class="badge">0</span>
+                        </summary>
+                        <div id="content-notes" class="tab-content" style="color: var(--ek-dim);">Ielādē piezīmes...</div>
+                    </details>
+
+                    <details id="missed-container" class="tab-container">
+                        <summary>
+                            <span class="side-icon" style="margin-right: 10px; width: 20px; height: 20px;">${ICONS.missed}</span>
+                            Kavējumi
+                        </summary>
+                        <div id="content-missed" class="tab-content" style="color: var(--ek-dim);">Ielādē kavējumus...</div>
+                    </details>
+
+                    <div class="day-nav">
+                        <button id="btn-prev" class="nav-btn" aria-label="Iepriekšējā diena">&larr;</button>
+                        <div class="date-display">
+                            <span id="date-label"></span>
+                            <input type="date" id="date-picker">
+                        </div>
+                        <button id="btn-next" class="nav-btn" aria-label="Nākamā diena">&rarr;</button>
+                    </div>
+                    <div class="today-row" id="today-row" hidden><button id="btn-today" class="today-btn">Šodien</button></div>
+                    <div id="diary-content" style="transition: opacity 0.2s;"></div>
+                </div>
+
+                <!-- TASKS VIEW -->
+                <div id="view-tasks" class="view">
+                    <div class="header-bar"><h1>Darbi</h1></div>
+                    <div id="content-tasks" style="color: var(--ek-dim);">Ielādē darbus...</div>
+                </div>
+
+                <!-- MAIL VIEW -->
+                <div id="view-mail" class="view">
+                    <div class="header-bar"><h1>Pasts</h1></div>
+                    <div style="margin-bottom: 15px;">
+                        <button id="btn-compose" style="background: var(--ek-accent); color: var(--ek-on-accent); border: none; padding: 8px 16px; border-radius: 4px; font-weight: bold; cursor: pointer;">Rakstīt vēstuli</button>
+                    </div>
+                    <div id="compose-container" style="display: none; margin-bottom: 20px;">
+                        <div class="compose-form">
+                            <div class="selected-recipients" id="selected-recipients"></div>
+                            <div class="recipient-picker">
+                                <select id="group-select" class="compose-select"><option value="">Izvēlies grupu...</option></select>
+                                <select id="member-select" class="compose-select" disabled><option value="">Vispirms izvēlies grupu</option></select>
+                            </div>
+                            <input type="text" id="compose-subject" class="compose-input" placeholder="Tēma">
+                            <textarea id="compose-body" class="compose-textarea" placeholder="Ziņa..."></textarea>
+                            <div class="attachment-list" id="attachment-list"></div>
+                            <div style="margin-top: 10px; display: flex; align-items: center; flex-wrap: wrap; gap: 8px;">
+                                <input type="file" id="file-upload" style="display: none;">
+                                <button id="btn-attach" class="btn-attach" style="margin-right: 0;">📎 Pievienot failu</button>
+                                <button id="btn-send" class="btn-send">Nosūtīt</button>
+                                <button id="btn-cancel" class="btn-cancel" style="margin-left: 0;">Atcelt</button>
+                            </div>
+                        </div>
+                    </div>
+                    <div id="content-mail" style="color: var(--ek-dim);">Ielādē pastu...</div>
+                </div>
+
+                <!-- NEWS VIEW -->
+                <div id="view-news" class="view">
+                    <div class="header-bar"><h1>Ziņas</h1></div>
+                    <div id="content-news" style="color: var(--ek-dim);">Ielādē ziņas...</div>
+                </div>
+
+                <!-- STATS VIEW -->
+                <div id="view-stats" class="view">
+                    <div class="header-bar"><h1>Statistika</h1></div>
+                    <div id="content-stats" style="color: var(--ek-dim);">Ielādē statistiku...</div>
+                </div>
+
+                <!-- LINKS VIEW -->
+                <div id="view-links" class="view">
+                    <div class="header-bar"><h1>Saites</h1></div>
+                    <div id="content-links" style="color: var(--ek-dim);">Ielādē saites...</div>
+                </div>
+
+                <!-- SETTINGS VIEW -->
+                <div id="view-settings" class="view">
+                    <div class="header-bar"><h1>Iestatījumi</h1></div>
+                    <div id="settings-nav"></div>
+                    <div id="content-settings" style="color: var(--ek-dim);">Ielādē iestatījumus...</div>
+                    <div id="settings-edit"></div>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(appContainer);
+
+        document.querySelectorAll('.side-item[data-view]').forEach(btn => {
+            btn.addEventListener('click', () => switchView(btn.dataset.view));
+        });
+
+        // Event Listeners
+        $('btn-prev').addEventListener('click', () => { currentDate.setDate(currentDate.getDate() - 1); loadDay(); });
+        $('btn-next').addEventListener('click', () => { currentDate.setDate(currentDate.getDate() + 1); loadDay(); });
+        $('btn-today').addEventListener('click', () => { currentDate = new Date(); loadDay(); });
+        $('date-picker').addEventListener('change', (e) => {
+            if (!e.target.value) return;
+            currentDate = new Date(e.target.value + 'T12:00:00');
+            loadDay();
+        });
+        $('btn-refresh').addEventListener('click', async () => {
+            const btn = $('btn-refresh');
+            if (btn.classList.contains('spin')) return;
+            btn.classList.add('spin');
+            await refreshAll();
+            btn.classList.remove('spin');
+            toast('Atjaunots', 'ok');
+        });
+
+        $('btn-compose').addEventListener('click', () => openComposer());
+        $('btn-cancel').addEventListener('click', closeComposer);
+        $('btn-send').addEventListener('click', sendEmail);
+        $('group-select').addEventListener('change', loadGroupMembers);
+        $('btn-attach').addEventListener('click', () => $('file-upload').click());
+        $('file-upload').addEventListener('change', uploadAttachment);
+
+        // Side menu order + cycle arrows
+        applyNavOrder();
+        applyNavArrows();
+        applyMissedVisibility();
+        renderNavSettings();
+        renderEditSettings();
+        $('content-grades').addEventListener('click', onGradesClick);
+        $('content-notes').addEventListener('click', onNotesClick);
+        $('btn-nav-up').addEventListener('click', () => cycleView(-1));
+        $('btn-nav-down').addEventListener('click', () => cycleView(1));
+
+        // Themes
+        applyTheme(getSavedTheme());
+        const themeMenu = $('theme-menu');
+        const themeBtn = $('btn-theme');
+        themeBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            themeMenu.hidden = !themeMenu.hidden;
+            themeBtn.classList.toggle('active', !themeMenu.hidden);
+        });
+        themeMenu.querySelectorAll('.theme-option').forEach(b => b.addEventListener('click', () => applyTheme(b.dataset.theme)));
+        document.addEventListener('click', (e) => {
+            if (!themeMenu.hidden && !themeMenu.contains(e.target) && !e.target.closest('#btn-theme')) {
+                themeMenu.hidden = true; themeBtn.classList.remove('active');
+            }
+        });
+
+        // Swipe the diary left/right to change day
+        (function() {
+            const el = $('diary-content');
+            let sx = 0, sy = 0, st = 0, tracking = false;
+            el.addEventListener('touchstart', (e) => {
+                tracking = e.touches.length === 1;
+                if (tracking) { sx = e.touches[0].clientX; sy = e.touches[0].clientY; st = Date.now(); }
+            }, { passive: true });
+            el.addEventListener('touchend', (e) => {
+                if (!tracking) return;
+                tracking = false;
+                const t = e.changedTouches[0];
+                const dx = t.clientX - sx, dy = t.clientY - sy;
+                if (Date.now() - st > 600 || Math.abs(dx) < 70 || Math.abs(dx) < Math.abs(dy) * 2) return;
+                if (String(window.getSelection && window.getSelection()).length > 0) return;
+                currentDate.setDate(currentDate.getDate() + (dx < 0 ? 1 : -1));
+                loadDay();
+            }, { passive: true });
+        })();
+
+        // Remember which home accordions (Atzīmes / Piezīmes / Kavējumi) were open
+        (function() {
+            const KEY = 'eklase_open_tabs';
+            let saved = {};
+            try { saved = JSON.parse(localStorage.getItem(KEY) || '{}') || {}; } catch (e) { saved = {}; }
+            document.querySelectorAll('#view-home .tab-container').forEach((d, i) => {
+                const id = `t${i}`;
+                if (saved[id]) d.open = true;
+                d.addEventListener('toggle', () => {
+                    saved[id] = d.open;
+                    try { localStorage.setItem(KEY, JSON.stringify(saved)); } catch (e) { /* ignore */ }
+                });
+            });
+        })();
+
+        // Tap a collapsed lesson to expand it (and again to collapse)
+        $('diary-content').addEventListener('click', (e) => {
+            if (e.target.closest('a, .att-link')) return;
+            if (String(window.getSelection && window.getSelection()).length > 0) return; // user is selecting text
+            const item = e.target.closest('.lesson-item.collapsible');
+            if (!item) return;
+            const collapsed = item.classList.toggle('collapsed');
+            if (collapsed) expandedLessons.delete(item.dataset.key); else expandedLessons.add(item.dataset.key);
+            const more = item.querySelector('.lesson-more');
+            if (more) more.textContent = collapsed ? 'Rādīt vairāk ▾' : 'Rādīt mazāk ▴';
+        });
+
+        loadProfiles();
+        loadDay();
+        loadStaticData();
+        startAutoRefresh();
+    }
+
+    // --- AUTO REFRESH ---
+    function refreshAll() {
+        lastRefresh = Date.now();
+        return Promise.all([loadStaticData(), loadDay()]);
+    }
+    function startAutoRefresh() {
+        document.addEventListener('visibilitychange', () => {
+            if (!document.hidden && Date.now() - lastRefresh > 2 * 60 * 1000) refreshAll();
+        });
+        setInterval(() => {
+            if (!document.hidden && Date.now() - lastRefresh > 5 * 60 * 1000) refreshAll();
+        }, 60 * 1000);
+    }
+
+    // --- COMPOSER LOGIC ---
+    let selectedRecipients = [];
+    let currentAttachments = [];
+    let currentMembers = [];
+    let groupsLoadedFor = null;
+    let composeMode = { type: 'mdt_new', prevId: 0 };
+
+    function openComposer(mode = { type: 'mdt_new', prevId: 0 }, subject = '', body = '', recipient = null) {
+        composeMode = mode;
+        selectedRecipients = recipient ? [recipient] : [];
+        currentAttachments = [];
+        $('compose-subject').value = subject;
+        $('compose-body').value = body;
+        renderRecipients();
+        renderAttachments();
+        $('compose-container').style.display = 'block';
+        $('btn-compose').style.display = 'none';
+        switchView('mail');
+        loadRecipientGroups();
+    }
+
+    function closeComposer() {
+        $('compose-container').style.display = 'none';
+        $('btn-compose').style.display = 'block';
+        $('compose-subject').value = '';
+        $('compose-body').value = '';
+        selectedRecipients = [];
+        currentAttachments = [];
+        $('group-select').value = '';
+        $('member-select').innerHTML = '<option value="">Vispirms izvēlies grupu</option>';
+        $('member-select').disabled = true;
+    }
+
+    async function loadRecipientGroups() {
+        if (groupsLoadedFor === ctx.profileId) return;
+        const groupSelect = $('group-select');
+        try {
+            const groups = await api(`mail/recipient-groups?studyYearId=${ctx.studyYearId}`);
+            groupSelect.innerHTML = '<option value="">Izvēlies grupu...</option>';
+            groups.forEach(g => {
+                const opt = document.createElement('option');
+                opt.value = g.id; opt.textContent = g.name;
+                groupSelect.appendChild(opt);
+            });
+            groupsLoadedFor = ctx.profileId;
+        } catch (e) { console.error(e); toast("Neizdevās ielādēt grupas.", 'error'); }
+    }
+
+    async function loadGroupMembers(e) {
+        const groupId = e.target.value;
+        const memberSelect = $('member-select');
+        if (!groupId) { memberSelect.innerHTML = '<option value="">Vispirms izvēlies grupu</option>'; memberSelect.disabled = true; return; }
+        memberSelect.innerHTML = '<option>Ielādē...</option>'; memberSelect.disabled = true;
+        try {
+            const members = await api(`mail/recipient-groups/${groupId}/members?studyYearId=${ctx.studyYearId}`);
+            if ($('group-select').value !== groupId) return; // user already picked another group
+            currentMembers = members.map(m => ({ id: m.id, name: `${m.firstName} ${m.lastName}`, groupId: parseInt(groupId) }));
+            memberSelect.innerHTML = '<option value="">Izvēlies cilvēku...</option>';
+            members.forEach((m, idx) => {
+                const opt = document.createElement('option');
+                opt.value = String(idx);
+                opt.textContent = `${m.firstName} ${m.lastName} ${m.description || ''}`;
+                memberSelect.appendChild(opt);
+            });
+            memberSelect.disabled = false;
+            memberSelect.onchange = () => {
+                if (memberSelect.value === '') return;
+                const m = currentMembers[parseInt(memberSelect.value, 10)];
+                if (m && !selectedRecipients.find(r => r.id === m.id)) {
+                    selectedRecipients.push({ id: parseInt(m.id), name: m.name, groupId: m.groupId });
+                    renderRecipients();
+                }
+                memberSelect.value = "";
+            };
+        } catch (err) { memberSelect.innerHTML = '<option>Kļūda</option>'; }
+    }
+
+    function renderRecipients() {
+        const container = $('selected-recipients');
+        container.innerHTML = '';
+        selectedRecipients.forEach((r, index) => {
+            const tag = document.createElement('div');
+            tag.className = 'recipient-tag';
+            const label = document.createElement('div');
+            label.textContent = r.name;
+            const x = document.createElement('span');
+            x.textContent = '×';
+            x.addEventListener('click', () => { selectedRecipients.splice(index, 1); renderRecipients(); });
+            tag.appendChild(label); tag.appendChild(x);
+            container.appendChild(tag);
+        });
+    }
+
+    async function uploadAttachment(e) {
+        const file = e.target.files[0];
+        if (!file) return;
+        const btnAttach = $('btn-attach');
+        btnAttach.textContent = '⏳ Augšupielādē...'; btnAttach.disabled = true;
+        const formData = new FormData(); formData.append('file', file);
+        try {
+            const res = await api('attachments', { method: 'POST', body: formData, isFormData: true });
+            if (res && res.length > 0 && res[0].status === 'Ok') {
+                currentAttachments.push({ id: res[0].id, name: res[0].fileName, sizeInBytes: file.size });
+                renderAttachments();
+            } else { toast("Neizdevās augšupielādēt failu.", 'error'); }
+        } catch (err) { toast("Neizdevās augšupielādēt failu.", 'error'); }
+        finally { btnAttach.textContent = '📎 Pievienot failu'; btnAttach.disabled = false; e.target.value = ''; }
+    }
+
+    function renderAttachments() {
+        const container = $('attachment-list');
+        container.innerHTML = '';
+        currentAttachments.forEach((a, i) => {
+            const div = document.createElement('div');
+            div.className = 'attachment-item';
+            const label = document.createElement('div');
+            label.textContent = `📎 ${a.name} (${Math.round(a.sizeInBytes / 1024)} KB)`;
+            const x = document.createElement('span');
+            x.textContent = '×';
+            x.addEventListener('click', () => { currentAttachments.splice(i, 1); renderAttachments(); });
+            div.appendChild(label); div.appendChild(x);
+            container.appendChild(div);
+        });
+    }
+
+    async function sendEmail() {
+        const subject = $('compose-subject').value.trim();
+        const bodyText = $('compose-body').value.trim();
+        if (selectedRecipients.length === 0) return toast("Lūdzu izvēlies vismaz vienu saņēmēju!", 'error');
+        if (!subject) return toast("Lūdzu ievadi tēmu!", 'error');
+        const bodyHtml = `<p>${esc(bodyText).replace(/\n/g, '<br>')}</p>`;
+        const payload = {
+            subject: subject, body: bodyHtml, previousMessageId: composeMode.prevId, messageType: composeMode.type,
+            recipients: selectedRecipients.map(r => ({ id: r.id, name: r.name, groupId: r.groupId || null, description: "" })), attachments: []
+        };
+        const btnSend = $('btn-send');
+        btnSend.textContent = "Sūta..."; btnSend.disabled = true;
+        try {
+            const draft = await api('mail/messages', { method: 'POST', body: payload });
+            if (currentAttachments.length > 0) {
+                payload.attachments = currentAttachments;
+                await api(`mail/messages/${draft.id}`, { method: 'PUT', body: payload });
+            }
+            await api(`mail/messages/${draft.id}/send`, { method: 'PUT', body: { ...payload, recipients: selectedRecipients.map(r => ({ id: r.id, name: r.name })) } });
+            toast("Vēstule nosūtīta!", 'ok');
+            closeComposer();
+            loadStaticData();
+        } catch (e) { toast("Neizdevās nosūtīt: " + ((e && (e.message || e.code)) || 'kļūda'), 'error'); }
+        finally { btnSend.textContent = "Nosūtīt"; btnSend.disabled = false; }
+    }
+
+    async function deleteEmail(id) {
+        if (!confirm("Vai tiešām vēlies dzēst šo vēstuli?")) return;
+        try {
+            await api('mail/messages', { method: 'PATCH', body: { isDeleted: true, messageIds: [id] } });
+            loadStaticData();
+        } catch (e) { toast("Kļūda dzēšot vēstuli.", 'error'); }
+    }
+
+    // --- PROFILE SWITCHING ---
+    async function loadProfiles() {
+        const select = $('profile-select');
+        try {
+            const data = await api('user/profiles/by-year');
+            const currentYear = data.studyYears.find(y => y.isCurrent);
+            if (!currentYear) return;
+            select.innerHTML = '';
+            currentYear.profiles.forEach((p) => {
+                const opt = document.createElement('option');
+                opt.value = `${p.identity.profileId}|${p.identity.classId}`;
+                opt.textContent = `${p.user.schoolName} — ${p.user.className}`;
+                if (p.identity.profileId === ctx.profileId) opt.selected = true;
+                select.appendChild(opt);
+            });
+            select.disabled = false;
+            select.addEventListener('change', async (e) => {
+                const [newProfileId, newClassId] = e.target.value.split('|');
+                if (newProfileId === ctx.profileId) return;
+                select.disabled = true;
+                try {
+                    await api('user/profiles/switch', { method: 'POST', body: { profileId: newProfileId, classId: newClassId } });
+                    ctx.profileId = newProfileId; ctx.classId = newClassId;
+                    ['grades', 'missed', 'notes', 'mail', 'news', 'stats', 'links', 'settings', 'tasks'].forEach(k => {
+                        const el = $(`content-${k}`); el.innerHTML = 'Ielādē...'; el.style.color = 'var(--ek-dim)';
+                    });
+                    $('diary-content').innerHTML = '';
+                    closeComposer();
+                    groupsLoadedFor = null;
+                    $('group-select').innerHTML = '<option value="">Izvēlies grupu...</option>';
+                    await Promise.all([loadStaticData(), loadDay()]);
+                } catch (err) { toast("Neizdevās pārslēgt profilu.", 'error'); select.value = `${ctx.profileId}|${ctx.classId}`; }
+                finally { select.disabled = false; }
+            });
+        } catch (e) { console.error(e); }
+    }
+
+    async function refreshBadges() {
+        try {
+            const unseen = await api('user-unseen-events');
+            const mailTopBadge = $('mail-badge-top');
+            if (unseen.mailMessageCount > 0) { mailTopBadge.textContent = `Mail: ${unseen.mailMessageCount}`; mailTopBadge.style.display = 'block'; } else { mailTopBadge.style.display = 'none'; }
+            setBadge($('badge-grades'), unseen.evaluationCount);
+            setBadge($('badge-notes'), unseen.teacherMessagesCount?.behaviorEntries || 0);
+            setBadge($('side-badge-mail'), unseen.mailMessageCount);
+            setBadge($('side-badge-news'), unseen.newsCount?.school || 0);
+        } catch (e) { console.error(e); }
+    }
+
+    // --- RENDERERS ---
+    function renderGrades(gradesData) {
+        const container = $('content-grades');
+        if (gradesData) lastGradesData = gradesData;
+        if (container.querySelector('.edit-box')) return; // an editor is open; don't wipe it
+        if (!gradesData || !gradesData.evaluations || gradesData.evaluations.length === 0) { container.innerHTML = 'Nav atzīmju.'; container.style.color = 'var(--ek-text)'; return; }
+        const edits = loadEdits().grades;
+        let html = '';
+        const list = [...gradesData.evaluations].sort((a, b) => new Date(b.lesson.date) - new Date(a.lesson.date));
+        list.forEach(g => {
+            const original = String(g.value ?? '');
+            const ov = edits[String(g.id)];
+            const value = ov && ov.value != null ? String(ov.value) : original;
+            const edited = value !== original;
+            const isPercent = value.includes('%');
+            const subject = stripHtml(g.lesson.subject);
+            html += `
+                <div class="grade-item${editMode ? ' editable' : ''}" data-gid="${esc(g.id)}">
+                    <div>
+                        <div class="date-label">${formatShortDate(g.lesson.date)} <span class="entered-label">(Ievadīts: ${formatShortDate(g.timeCreated)})</span>${g.isNew ? '<span style="color:var(--ek-bad); font-size:0.75em; margin-left:6px;">JAUNS</span>' : ''}${edited ? '<span class="edited-mark" title="Labots lokāli">✎</span>' : ''}</div>
+                        <div style="font-weight:bold; color:var(--ek-text); font-size:1.05em;">${esc(g.disciplineName)}</div>
+                        ${subject ? `<div style="color:var(--ek-dim); font-size:0.9em; margin-top:3px;">${esc(subject)}</div>` : ''}
+                    </div>
+                    <div class="grade-val ${isPercent ? 'percent' : ''}">${esc(value)}</div>
+                </div>`;
+        });
+        container.innerHTML = html; container.style.color = 'var(--ek-text)';
+    }
+
+    // Missed lessons only (taken from the same evaluations/summary data as the grades)
+    function renderMissed(gradesData) {
+        const container = $('content-missed');
+        if (!container) return;
+        const days = (gradesData && gradesData.nonAttendances) || [];
+        const flat = [];
+        days.forEach(day => {
+            (day.nonAttendances || []).forEach(m => flat.push({ ...m, date: day.date }));
+        });
+        if (flat.length === 0) { container.innerHTML = 'Nav kavējumu.'; container.style.color = 'var(--ek-text)'; return; }
+        flat.sort((a, b) => new Date(b.date) - new Date(a.date));
+        let html = '';
+        flat.forEach(m => {
+            // 'n' = neattaisnots (unjustified), otherwise attaisnots (justified)
+            const isUnjustified = m.value === 'n';
+            const statusText = isUnjustified ? 'Neattaisnots' : 'Attaisnots';
+            const statusColor = isUnjustified ? 'var(--ek-bad)' : 'var(--ek-warn)';
+            // 'type' (e.g. "c") is shown as a small raised letter next to the value
+            const typeHtml = m.type ? `<sup style="font-size:0.6em; line-height:0; margin-left:2px;">${esc(m.type)}</sup>` : '';
+            html += `
+                <div class="grade-item">
+                    <div>
+                        <div class="date-label">${formatShortDate(m.date)}</div>
+                        <div style="font-weight:bold; color:${statusColor}; font-size:1.05em;">${esc(m.disciplineName)}</div>
+                        <div style="color:var(--ek-muted); font-size:0.9em; margin-top:3px;">${statusText}</div>
+                    </div>
+                    <div class="grade-val" style="color:${statusColor}; font-size:1.1em;">${esc((m.value || '').toUpperCase())}${typeHtml}</div>
+                </div>`;
+        });
+        container.innerHTML = html; container.style.color = 'var(--ek-text)';
+    }
+
+    function renderNotes(notesData) {
+        const container = $('content-notes');
+        if (notesData) lastNotesData = notesData;
+        if (container.querySelector('.edit-box')) return; // an editor is open; don't wipe it
+        if (!notesData || notesData.length === 0) { container.innerHTML = 'Nav piezīmju.'; container.style.color = 'var(--ek-text)'; return; }
+        const edits = loadEdits().notes;
+        let html = '';
+        const list = [...notesData].sort((a, b) => new Date(b.date) - new Date(a.date));
+        list.forEach(n => {
+            const key = noteKey(n);
+            const ov = edits[key] || {};
+            const origPos = noteOrigPos(n);
+            const isPos = ov.pos != null ? !!ov.pos : origPos;
+            const text = ov.text != null ? String(ov.text) : String(n.text ?? '');
+            const edited = isPos !== origPos || text !== String(n.text ?? '');
+            html += `
+                <div class="note-item" data-nkey="${esc(key)}">
+                    <div class="date-label">${formatShortDate(n.date)}${edited ? '<span class="edited-mark" title="Labots lokāli">✎</span>' : ''}</div>
+                    ${editMode ? `<div class="note-edit-row"><button class="chip-btn note-flip" type="button">${isPos ? '😊 Pozitīvs' : '😠 Negatīvs'} ⇄</button><span class="chip-hint">piespied, lai mainītu</span></div>` : ''}
+                    <div style="display:flex; justify-content:space-between; align-items:flex-start;">
+                        <span class="${isPos ? 'note-pos' : 'note-neg'} note-text${editMode ? ' editable-text' : ''}" style="font-weight:bold;">${isPos ? '😊' : '😠'} ${esc(text)}</span>
+                    </div>
+                    <div style="font-size:0.85em; color:var(--ek-dim); margin-top:5px;">${esc(n.authorName)} • ${esc(n.behaviorEntry?.disciplineName || '')}</div>
+                </div>`;
+        });
+        container.innerHTML = html; container.style.color = 'var(--ek-text)';
+    }
+
+    function renderNews(newsData) {
+        const container = $('content-news');
+        if (!newsData || newsData.length === 0) { container.innerHTML = 'Nav ziņu.'; container.style.color = 'var(--ek-text)'; return; }
+        let html = '';
+        const today = new Date();
+        newsData.forEach(n => {
+            const isUnread = n.isNew;
+            const newsDate = new Date(n.lastModificationDate);
+            const isToday = today.toDateString() === newsDate.toDateString();
+            const dateStr = isToday ? '<span style="color:var(--ek-good); font-weight:bold;">Šodien</span>' : formatShortDate(n.lastModificationDate);
+            let attHtml = '';
+            if (n.attachments && n.attachments.length > 0) {
+                attHtml = `<div style="margin-top: 10px; border-top: 1px solid var(--ek-soft); padding-top: 8px;">
+                    <strong style="color: var(--ek-gold);">Pielikumi:</strong><br>
+                    ${n.attachments.map(a => attLinkHtml(a, 'color: var(--ek-link); display: inline-block; margin-top: 4px; text-decoration: underline;')).join('<br>')}
+                </div>`;
+            }
+            html += `
+                <div class="news-item">
+                    <div class="news-title" style="color: ${isUnread ? 'var(--ek-text)' : 'var(--ek-dim)'}; display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px;">
+                        <span>${esc(n.title)}</span>
+                        <span style="font-size: 0.85em; color: var(--ek-muted); font-weight: normal;">(${dateStr})</span>
+                        ${isUnread ? '<span style="color:var(--ek-bad); font-size:0.7em;">JAUNS</span>' : ''}
+                    </div>
+                    ${n.body ? `<div class="news-body" style="margin-top: 8px;">${sanitizeHtml(n.body)}</div>` : ''}
+                    ${attHtml}
+                </div>`;
+        });
+        container.innerHTML = html; container.style.color = 'var(--ek-text)';
+        wireAttLinks(container);
+        wireBodyLinks(container, '.news-body');
+    }
+
+    function renderMail(mailData) {
+        const container = $('content-mail');
+        if (!mailData || mailData.length === 0) { container.innerHTML = 'Nav vēstuļu.'; container.style.color = 'var(--ek-text)'; return; }
+        // Remember which mails are open so a background refresh doesn't collapse them.
+        const openIds = new Set(Array.from(container.querySelectorAll('.mail-item[open]')).map(d => d.dataset.id));
+        const list = [...mailData].sort((a, b) => new Date(b.timeCreated) - new Date(a.timeCreated));
+        const byId = new Map(list.map(m => [String(m.id), m]));
+        let html = '';
+        list.forEach(m => {
+            const isUnread = m.status === 'unread';
+            const author = (m.authorName || '').split(' (')[0];
+            let attHtml = '';
+            if (m.attachments && m.attachments.length > 0) {
+                attHtml = `<div style="margin-top: 10px; border-top: 1px solid var(--ek-soft); padding-top: 8px;">
+                    <strong style="color: var(--ek-gold);">Pielikumi:</strong><br>
+                    ${m.attachments.map(a => attLinkHtml(a, 'color: var(--ek-link); display: inline-block; margin-top: 4px; text-decoration: underline;')).join('<br>')}
+                </div>`;
+            }
+            html += `
+                <details class="mail-item" data-id="${esc(m.id)}" data-unread="${isUnread}">
+                    <summary>
+                        <div style="padding-right: 15px;">
+                            <div class="mail-subject" style="font-weight: ${isUnread ? 'bold' : 'normal'}; color: ${isUnread ? 'var(--ek-text)' : 'var(--ek-dim)'};">
+                                ${m.subject ? esc(m.subject) : '(Bez tēmas)'}
+                            </div>
+                            <div class="mail-meta">${esc(author)} • ${formatShortDate(m.timeCreated)}</div>
+                        </div>
+                        ${isUnread ? '<div class="unread-dot"></div>' : ''}
+                    </summary>
+                    <div class="mail-body">
+                        ${sanitizeHtml(m.body || '')}
+                        ${attHtml}
+                        <div class="mail-actions">
+                            <button class="mail-btn btn-reply">Atbildēt</button>
+                            <button class="mail-btn btn-forward">Pārsūtīt</button>
+                            <button class="mail-btn danger btn-delete">Dzēst</button>
+                        </div>
+                    </div>
+                </details>`;
+        });
+        container.innerHTML = html; container.style.color = 'var(--ek-text)';
+        container.querySelectorAll('.mail-item').forEach(details => {
+            if (openIds.has(details.dataset.id)) details.open = true;
+            details.addEventListener('toggle', async () => {
+                if (details.open && details.dataset.unread === 'true') {
+                    const msgId = parseInt(details.dataset.id);
+                    details.dataset.unread = 'false';
+                    const dot = details.querySelector('.unread-dot');
+                    if (dot) dot.remove();
+                    const subj = details.querySelector('.mail-subject');
+                    subj.style.fontWeight = 'normal'; subj.style.color = 'var(--ek-dim)';
+                    try { await api('mail/messages/read', { method: 'PATCH', body: { messageIds: [msgId] } }); refreshBadges(); }
+                    catch (err) { console.error(err); }
+                }
+            });
+            const id = parseInt(details.dataset.id);
+            const subj = (byId.get(details.dataset.id) || {}).subject || '';
+            details.querySelector('.btn-reply').addEventListener('click', (ev) => { ev.stopPropagation(); openComposer({ type: 'mdt_reply', prevId: id }, `RE: ${subj}`, '', null); });
+            details.querySelector('.btn-forward').addEventListener('click', (ev) => { ev.stopPropagation(); openComposer({ type: 'mdt_forward', prevId: id }, `FWD: ${subj}`); });
+            details.querySelector('.btn-delete').addEventListener('click', (ev) => { ev.stopPropagation(); deleteEmail(id); });
+        });
+        wireAttLinks(container);
+        wireBodyLinks(container, '.mail-body');
+    }
+
+    function renderTasks(testsData, thirdPartyData) {
+        const container = $('content-tasks');
+        let tasks = [];
+        if (testsData) {
+            testsData.forEach(day => {
+                (day.scheduledTests || []).forEach(test => {
+                    tasks.push({ date: day.date, type: 'Pārbaudes darbs', typeColor: '#ffa502', subject: test.discipline.name, desc: stripHtml(test.description.text) || 'Nav apraksta', teacher: (test.discipline.teacherNames || []).join(', '), lessonNum: test.lessonNumberInDiary, attachments: test.description.attachments || [] });
+                });
+            });
+        }
+        if (thirdPartyData) {
+            thirdPartyData.forEach(tp => {
+                if (tp.applicationId !== 'uzdevumi' && tp.applicationId !== 'soma') return;
+                tasks.push({ date: tp.date, type: tp.applicationName, typeColor: '#9b59b6', subject: tp.classJournalName.disciplineName, desc: tp.name, teacher: tp.lastModification.authorName, url: safeUrl(`${BASE_URL}${tp.url}`), attachments: [] });
+            });
+        }
+        if (tasks.length === 0) { container.innerHTML = '<div style="text-align: center; opacity: 0.5; margin-top: 20px;">Nav aktīvu darbu.</div>'; return; }
+        tasks.sort((a, b) => new Date(a.date) - new Date(b.date));
+        let html = '';
+        const today = new Date(); today.setHours(0, 0, 0, 0);
+        tasks.forEach(t => {
+            const taskDate = new Date(t.date); taskDate.setHours(0, 0, 0, 0);
+            const diffDays = Math.round((taskDate - today) / (1000 * 60 * 60 * 24));
+            let statusClass = ''; let dateLabel = formatShortDate(t.date);
+            if (diffDays < 0) { statusClass = 'overdue'; dateLabel += ' (Nokavēts)'; }
+            else if (diffDays === 0) { statusClass = 'today'; dateLabel += ' (Šodien)'; }
+            else if (diffDays === 1) { statusClass = 'tomorrow'; dateLabel += ' (Rīt)'; }
+            let attHtml = '';
+            if (t.attachments && t.attachments.length > 0) {
+                attHtml = `<div style="margin-top: 8px;">${t.attachments.map(a => `<a href="#" class="att-link" data-id="${esc(a.id)}" data-name="${esc(a.name)}" style="color: var(--ek-link); display: inline-block; margin-right: 10px; text-decoration: underline;">📎 ${esc(a.name)}</a>`).join('')}</div>`;
+            }
+            let linkHtml = '';
+            if (t.url) { linkHtml = `<div style="margin-top: 8px;"><a href="${esc(t.url)}" target="_blank" rel="noopener noreferrer" style="color: var(--ek-purple); font-weight: bold; text-decoration: none;">Atvērt uzdevumu ➔</a></div>`; }
+            const lessonInfo = t.lessonNum ? ` • ${esc(t.lessonNum)}. stunda` : '';
+            html += `
+                <div class="task-item ${statusClass}">
+                    <div class="task-header">
+                        <div class="task-date">${dateLabel}</div>
+                        <div class="task-type" style="background: ${t.typeColor}22; color: ${t.typeColor}; border: 1px solid ${t.typeColor}55;">${esc(t.type)}</div>
+                    </div>
+                    <div class="task-subject">${esc(t.subject)}</div>
+                    <div class="task-desc">${esc(t.desc)}</div>
+                    <div class="task-meta">${esc(t.teacher)}${lessonInfo}</div>
+                    ${attHtml}${linkHtml}
+                </div>`;
+        });
+        container.innerHTML = html; container.style.color = 'var(--ek-text)';
+        wireAttLinks(container);
+    }
+
+    function renderStats(ratingsData, attendanceData, journalsData, excusesData) {
+        const container = $('content-stats');
+        let html = '';
+        if (attendanceData && attendanceData.disciplineTypes) {
+            const mandatory = attendanceData.disciplineTypes.find(d => d.type === 'MandatoryContent');
+            if (mandatory) {
+                html += `<div class="stats-section"><div class="stats-title">Kavējumi</div><div style="display: flex; flex-wrap: wrap; gap: 8px 20px; font-size: 0.95em;">
+                    <div>Iespējamās stundas: <strong>${esc(mandatory.attendableLessonsCount)}</strong></div>
+                    <div>Attaisnoti: <strong style="color: var(--ek-gold);">${esc(mandatory.justifiedCount)}</strong></div>
+                    <div>Neattaisnoti: <strong style="color: var(--ek-bad);">${esc(mandatory.nonJustifiedCount)}</strong></div>
+                </div></div>`;
+            }
+        }
+        if (excusesData && excusesData.length > 0) {
+            html += `<div class="stats-section"><div class="stats-title">Attaisnojumi</div>
+                ${[...excusesData].sort((a, b) => new Date(b.period.from) - new Date(a.period.from)).map(e => {
+                    const dateFrom = formatShortDate(e.period.from); const dateTo = formatShortDate(e.period.to);
+                    const dateStr = dateFrom === dateTo ? dateFrom : `${dateFrom} - ${dateTo}`;
+                    const cleanNote = (e.notes || '').replace('Vecāku komentārs: ', '');
+                    return `<div class="excuse-item"><div class="excuse-date">${dateStr}</div><div class="excuse-note">${esc(cleanNote)}</div><div class="excuse-meta">Iesniedza: ${esc(e.authorName)}</div></div>`;
+                }).join('')}</div>`;
+        }
+        if (ratingsData && ratingsData.length > 0) {
+            const numericData = ratingsData.find(r => r.type === 'Numeric');
+            if (numericData && numericData.charts?.averageEvaluationsByDisciplineChart?.chartValues) {
+                const chartValues = numericData.charts.averageEvaluationsByDisciplineChart.chartValues;
+                html += `<div class="stats-section"><div class="stats-title">Vidējās atzīmes (1-10)</div>
+                    <div class="stats-grid stats-header"><div>Priekšmets</div><div class="stats-val">Mana</div><div class="stats-val">Klase</div></div>
+                    ${chartValues.map(v => {
+                        let colorClass = 'stats-neg';
+                        if (v.isStudentEvaluationHigherOrEqualToClassEvaluation) colorClass = 'stats-pos';
+                        else if (v.averageStudentEvaluation.value >= 4) colorClass = 'stats-warn';
+                        return `<div class="stats-grid"><div>${esc(v.disciplineName)}</div><div class="stats-val ${colorClass}">${esc(v.averageStudentEvaluation.stringValue)}</div><div class="stats-val" style="color: var(--ek-muted);">${esc(v.averageClassEvaluation.stringValue)}</div></div>`;
+                    }).join('')}</div>`;
+            }
+        }
+        if (journalsData && journalsData.length > 0) {
+            html += `<div class="stats-section"><div class="stats-title">Skolotāji</div>
+                <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; font-size: 0.9em;">
+                    ${journalsData.map(j => {
+                        const teacherNames = (j.journalTeachers || []).map(t => `${t.firstName} ${t.lastName}`).join(', ');
+                        return `<div style="background: var(--ek-surface2); padding: 8px; border-radius: 4px;"><div style="color: var(--ek-accent); font-weight: bold; margin-bottom: 3px;">${esc(j.name)}</div><div style="color: var(--ek-text2);">${esc(teacherNames) || '-'}</div></div>`;
+                    }).join('')}
+                </div></div>`;
+        }
+        container.innerHTML = html || 'Nav statistikas datu.';
+        container.style.color = 'var(--ek-text)';
+    }
+
+    function renderLinks(linksData) {
+        const container = $('content-links');
+        if (!linksData) { container.innerHTML = 'Nav saišu.'; return; }
+        let html = '';
+        if (linksData.remoteSystemsLinks && linksData.remoteSystemsLinks.length > 0) {
+            html += `<div class="stats-title">Mācību platformas</div><div class="links-grid" style="margin-bottom: 20px;">`;
+            linksData.remoteSystemsLinks.forEach(link => {
+                html += `<a href="${esc(safeUrl(link.url))}" target="_blank" rel="noopener noreferrer" class="link-card"><div class="link-name">${esc(link.name)}</div><div class="link-url">${link.isSingleSignOn ? 'Automātiska pieteikšanās' : 'Ārējā saite'}</div></a>`;
+            });
+            html += `</div>`;
+        }
+        if (linksData.schoolLinks && linksData.schoolLinks.length > 0) {
+            html += `<div class="stats-title">Skolas saites</div><div class="links-grid">`;
+            linksData.schoolLinks.forEach(link => {
+                html += `<a href="${esc(safeUrl(link.url))}" target="_blank" rel="noopener noreferrer" class="link-card"><div class="link-name">${esc(link.name)}</div><div class="link-url">${esc(link.url)}</div></a>`;
+            });
+            html += `</div>`;
+        }
+        container.innerHTML = html || 'Nav saišu.';
+        container.style.color = 'var(--ek-text)';
+    }
+
+    function renderSettings(userData, familyData, notifData) {
+        const container = $('content-settings');
+        ctx.username = userData.username;
+        let html = `
+            <div class="stats-section">
+                <div class="stats-title">Profila informācija</div>
+                <div style="margin-bottom: 10px;"><strong>Vārds:</strong> ${esc(userData.firstName)} ${esc(userData.lastName)}</div>
+                <div style="margin-bottom: 10px;"><strong>Skola:</strong> ${esc(userData.school.name)}</div>
+                <div style="margin-bottom: 10px;"><strong>Klase:</strong> ${esc(userData.class.name)}</div>
+                <div style="margin-bottom: 10px;"><strong>E-pasts:</strong> ${esc(userData.emailAddress)}</div>
+            </div>
+            <div class="stats-section" style="border-top: 1px solid var(--ek-soft); padding-top: 15px;">
+                <div class="stats-title">Mainīt lietotājvārdu</div>
+                <div style="display: flex; gap: 10px; align-items: center;">
+                    <input type="text" id="input-username" class="compose-input" style="margin-bottom: 0; flex: 1;" value="${esc(userData.username)}">
+                    <button id="btn-save-username" class="btn-send" style="padding: 8px 16px;">Saglabāt</button>
+                </div>
+                <div id="username-msg" style="margin-top: 10px; font-weight: bold; font-size: 0.9em;"></div>
+            </div>`;
+        if (familyData && familyData.familyMembers) {
+            html += `<div class="stats-section" style="border-top: 1px solid var(--ek-soft); padding-top: 15px;">
+                <div class="stats-title">Ģimenes locekļi</div>
+                <div style="display: flex; flex-direction: column; gap: 8px;">
+                    ${familyData.familyMembers.map(m => `
+                        <div style="background: var(--ek-surface2); padding: 10px; border-radius: 4px;">
+                            <div style="font-weight: bold; color: var(--ek-accent);">${esc(m.personTypeName)}</div>
+                            <div style="font-size: 0.9em; color: var(--ek-text2); margin-top: 4px;">
+                                ${m.userProfile.phoneNumber ? `📞 ${esc(m.userProfile.phoneNumber)}` : ''}
+                                ${m.userProfile.emailAddress ? `<br>✉️ ${esc(m.userProfile.emailAddress)}` : ''}
+                            </div>
+                        </div>`).join('')}
+                </div></div>`;
+        }
+        if (notifData) {
+            html += `<div class="stats-section" style="border-top: 1px solid var(--ek-soft); padding-top: 15px;">
+                <div class="stats-title">Paziņojumi (Push)</div>
+                <div style="display: flex; flex-direction: column; gap: 5px; font-size: 0.9em; margin-bottom: 10px;">
+                    <div style="display:flex; justify-content:space-between;"><span>Atzīmes:</span> <span>${notifData.pushNotifications.isEvaluationNotificationsEnabled ? '✅' : '❌'}</span></div>
+                    <div style="display:flex; justify-content:space-between;"><span>Piezīmes:</span> <span>${notifData.pushNotifications.isBehaviorEntryNotificationsEnabled ? '✅' : '❌'}</span></div>
+                    <div style="display:flex; justify-content:space-between;"><span>Mājasdarbi:</span> <span>${notifData.pushNotifications.isHomeTaskNotificationsEnabled ? '✅' : '❌'}</span></div>
+                </div></div>`;
+        }
+        html += `<div class="stats-section" style="border-top: 1px solid var(--ek-soft); padding-top: 15px;">
+            <div class="stats-title">Preferences</div>
+            <div class="toggle-row"><span>Reklāmas</span><label class="toggle-switch"><input type="checkbox" id="toggle-ads" ${userData.userSettings.isAdvertisingEnabled ? 'checked' : ''}><span class="slider"></span></label></div>
+            <div class="toggle-row"><span>Komerciālās ziņas</span><label class="toggle-switch"><input type="checkbox" id="toggle-news" ${userData.userSettings.isCommercialNewsSubscriber ? 'checked' : ''}><span class="slider"></span></label></div>
+        </div>`;
+        container.innerHTML = html; container.style.color = 'var(--ek-text)';
+
+        $('btn-save-username').addEventListener('click', async () => {
+            const newUsername = $('input-username').value.trim();
+            const msgEl = $('username-msg');
+            if (!newUsername) return;
+            if (newUsername === ctx.username) { msgEl.textContent = 'Lietotājvārds nav mainīts.'; msgEl.style.color = 'var(--ek-muted)'; return; }
+            const btn = $('btn-save-username'); btn.textContent = 'Saglabā...'; btn.disabled = true; msgEl.textContent = '';
+            try {
+                await api('user/username', { method: 'POST', body: { username: newUsername } });
+                ctx.username = newUsername; msgEl.textContent = 'Lietotājvārds veiksmīgi nomainīts!'; msgEl.style.color = 'var(--ek-good)';
+            } catch (err) {
+                if (err && err.code === 'UsernameAlreadyExists') msgEl.textContent = 'Šis lietotājvārds jau ir aizņemts.';
+                else msgEl.textContent = 'Kļūda mainot lietotājvārdu.';
+                msgEl.style.color = 'var(--ek-bad)';
+            } finally { btn.textContent = 'Saglabāt'; btn.disabled = false; }
+        });
+        $('toggle-ads').addEventListener('change', async (e) => {
+            try { await api('user-settings/ads', { method: 'POST', body: { isAdvertisingEnabled: e.target.checked } }); }
+            catch (err) { console.error(err); e.target.checked = !e.target.checked; }
+        });
+        $('toggle-news').addEventListener('change', async (e) => {
+            try { await api('user-settings/commercial-news', { method: 'POST', body: { isCommercialNewsSubscriber: e.target.checked } }); }
+            catch (err) { console.error(err); e.target.checked = !e.target.checked; }
+        });
+    }
+
+    // --- FETCH STATIC DATA & APPLY CACHE ---
+    let staticGen = 0;
+    async function loadStaticData() {
+        const gen = ++staticGen;
+        const cachedGrades = getCache('grades'); if (cachedGrades) { renderGrades(cachedGrades); renderMissed(cachedGrades); }
+        const cachedNotes = getCache('notes'); if (cachedNotes) renderNotes(cachedNotes);
+        const cachedMail = getCache('mail'); if (cachedMail) renderMail(cachedMail);
+        const cachedNews = getCache('news'); if (cachedNews) renderNews(cachedNews);
+        const cachedStats = getCache('stats'); if (cachedStats) renderStats(cachedStats.ratings, cachedStats.attendance, cachedStats.journals, cachedStats.excuses);
+        const cachedLinks = getCache('links'); if (cachedLinks) renderLinks(cachedLinks);
+        const cachedSettings = getCache('settings'); if (cachedSettings) renderSettings(cachedSettings.user, cachedSettings.family, cachedSettings.notif);
+        const cachedTasks = getCache('tasks'); if (cachedTasks) renderTasks(cachedTasks.tests, cachedTasks.thirdParty);
+
+        try {
+            const user = await api('user');
+            if (gen !== staticGen) return;
+            ctx.studyYearId = user.studyYearId;
+            const yearStart = user.studyYear.datePeriod.from.split('T')[0];
+            const yearEnd = user.studyYear.datePeriod.to.split('T')[0];
+
+            const fetchMail = async () => {
+                const msgIds = await api('mail/message-ids?request.folderType=standardType_fmft_inbox');
+                if (!msgIds || msgIds.length === 0) return [];
+                return api(`mail/messages?commaSeparatedIds=${msgIds.slice(0, 20).join(',')}`);
+            };
+
+            // allSettled: one failing endpoint no longer blanks the whole page.
+            const [rGrades, rNotes, rNews, rRatings, rAttendance, rJournals, rLinks, rFamily, rNotif, rExcuses, rTests, rThird, rMail] = await Promise.allSettled([
+                api('evaluations/summary'), api('teacher-messages'), api('news'),
+                api(`evaluation-ratings?includeSameLevelClasses=false&datePeriodModel.from=${yearStart}&datePeriodModel.to=${yearEnd}`),
+                api(`non-attendances/statistics?datePeriodModel.from=${yearStart}&datePeriodModel.to=${yearEnd}`),
+                api('journals'), api('links'), api('family-members/current-student/settings'),
+                api(`user-settings/notifications/${ctx.profileId}`),
+                api(`absence-excuses?datePeriodModel.from=${yearStart}&datePeriodModel.to=${yearEnd}`),
+                api('test-schedules'), api('third-party-events'),
+                fetchMail()
+            ]);
+            if (gen !== staticGen) return;
+
+            const ok = (r) => r.status === 'fulfilled';
+            let failed = 0;
+            [rGrades, rNotes, rNews, rRatings, rAttendance, rJournals, rLinks, rFamily, rNotif, rExcuses, rTests, rThird, rMail].forEach(r => { if (!ok(r)) { failed++; console.error("Request failed", r.reason); } });
+
+            if (ok(rGrades)) { renderGrades(rGrades.value); renderMissed(rGrades.value); saveCache('grades', rGrades.value); } else { failIfLoading('content-grades'); failIfLoading('content-missed'); }
+            if (ok(rNotes)) { renderNotes(rNotes.value); saveCache('notes', rNotes.value); } else failIfLoading('content-notes');
+            if (ok(rMail)) { renderMail(rMail.value); saveCache('mail', rMail.value); } else failIfLoading('content-mail');
+            if (ok(rNews)) { renderNews(rNews.value); saveCache('news', rNews.value); } else failIfLoading('content-news');
+
+            const ps = getCache('stats') || {};
+            const stats = {
+                ratings: ok(rRatings) ? rRatings.value : ps.ratings,
+                attendance: ok(rAttendance) ? rAttendance.value : ps.attendance,
+                journals: ok(rJournals) ? rJournals.value : ps.journals,
+                excuses: ok(rExcuses) ? rExcuses.value : ps.excuses
+            };
+            renderStats(stats.ratings, stats.attendance, stats.journals, stats.excuses);
+            saveCache('stats', stats);
+
+            if (ok(rLinks)) { renderLinks(rLinks.value); saveCache('links', rLinks.value); } else failIfLoading('content-links');
+
+            const pset = getCache('settings') || {};
+            const settings = {
+                user,
+                family: ok(rFamily) ? rFamily.value : pset.family,
+                notif: ok(rNotif) ? rNotif.value : pset.notif
+            };
+            renderSettings(settings.user, settings.family, settings.notif);
+            saveCache('settings', settings);
+
+            const pt = getCache('tasks') || {};
+            const tasks = {
+                tests: ok(rTests) ? rTests.value : pt.tests,
+                thirdParty: ok(rThird) ? rThird.value : pt.thirdParty
+            };
+            renderTasks(tasks.tests, tasks.thirdParty);
+            saveCache('tasks', tasks);
+
+            if (failed > 0) toast("Daļu datu neizdevās ielādēt.", 'error');
+        } catch (e) {
+            console.error("Static data fetch failed", e);
+            if (gen !== staticGen) return;
+            ['grades', 'missed', 'notes', 'mail', 'news', 'stats', 'links', 'settings', 'tasks'].forEach(k => failIfLoading(`content-${k}`));
+            toast("Neizdevās ielādēt datus.", 'error');
+        }
+    }
+
+    // --- DYNAMIC DATA (Diary) ---
+    let dayGen = 0;
+    async function loadDay() {
+        const gen = ++dayGen;
+        const content = $('diary-content');
+        const dateStr = getLocalDateStr(currentDate);
+        $('date-label').textContent = formatDate(dateStr);
+        $('date-picker').value = dateStr;
+        $('today-row').hidden = (dateStr === getLocalDateStr(new Date()));
+        const cachedDiary = getCache(`diary_${dateStr}`);
+        if (cachedDiary) { renderDay(cachedDiary); }
+        else { content.innerHTML = ''; }
+        content.style.opacity = cachedDiary ? '1' : '0.5';
+        try {
+            const diary = await api(`diary?from=${dateStr}&to=${dateStr}`);
+            if (gen !== dayGen) return; // a newer day was requested meanwhile
+            renderDay(diary);
+            saveCache(`diary_${dateStr}`, diary);
+            refreshBadges();
+        } catch (e) {
+            if (gen !== dayGen) return;
+            if (!cachedDiary) { content.innerHTML = `<div style="background: var(--ek-surface2); padding: 15px; border-radius: 8px; border: 1px solid var(--ek-bad); text-align: center;"><h2 style="color: var(--ek-bad); margin-top:0; font-size:1.1em;">Error</h2><p style="font-size:0.9em;">${esc((e && (e.message || e.code)) || 'Nezināma kļūda')}</p></div>`; }
+        } finally { if (gen === dayGen) content.style.opacity = '1'; }
+    }
+
+    // Lessons whose content is taller than this get collapsed with a fade + "show more".
+    const LESSON_COLLAPSE_PX = 150;
+    const expandedLessons = new Set();
+    function applyLessonCollapse() {
+        document.querySelectorAll('#diary-content .lesson-item').forEach(item => {
+            const body = item.querySelector('.lesson-body');
+            if (!body || item.dataset.collapseChecked) return;
+            const h = body.scrollHeight;
+            if (!h) return; // view is hidden right now; retried when it's shown
+            item.dataset.collapseChecked = '1';
+            if (h <= LESSON_COLLAPSE_PX) return;
+            const expanded = expandedLessons.has(item.dataset.key);
+            item.classList.add('collapsible');
+            if (!expanded) item.classList.add('collapsed');
+            const more = document.createElement('div');
+            more.className = 'lesson-more';
+            more.textContent = expanded ? 'Rādīt mazāk ▴' : 'Rādīt vairāk ▾';
+            body.after(more);
+        });
+    }
+
+    function renderDay(diaryData) {
+        const content = $('diary-content');
+        let html = '';
+        const day = diaryData && diaryData[0];
+        if (!day || day.isEmptyDay || !day.lessons || day.lessons.length === 0) { content.innerHTML = `<div style="text-align: center; opacity: 0.5; margin-top: 30px;">Nav stundu šajā dienā.</div>`; return; }
+        let highestLessonNum = 0;
+        day.lessons.forEach(l => { if (typeof l.lessonNumber === 'number' && l.lessonNumber > highestLessonNum) highestLessonNum = l.lessonNumber; });
+        let extraCounter = 1;
+        const dateKey = getLocalDateStr(currentDate);
+        html += `<div class="diary-card"><ul style="list-style: none; padding: 0; margin: 0;">`;
+        day.lessons.forEach((lesson, lessonIdx) => {
+            const isCancelled = lesson.classJournalName === '--';
+            let prefix = ""; let calcNum = lesson.lessonNumber;
+            if (!calcNum) { prefix = "Fakultatīvs."; calcNum = highestLessonNum + extraCounter; extraCounter++; }
+            else { prefix = `${calcNum}.`; }
+            const timeStr = getLessonTime(calcNum);
+            let isNow = false;
+            if (dateKey === getLocalDateStr(new Date()) && !isCancelled) {
+                const nowD = new Date();
+                const nowMins = nowD.getHours() * 60 + nowD.getMinutes();
+                const startMins = 8 * 60 + (calcNum - 1) * 50;
+                isNow = nowMins >= startMins && nowMins < startMins + 40;
+            }
+            const timeHtml = timeStr ? `<span class="lesson-time">[${timeStr}]</span>` : '';
+            html += `<li class="lesson-item${isNow ? ' lesson-now' : ''}" data-key="${dateKey}:${lessonIdx}">`;
+            if (isCancelled) {
+                html += `<div class="lesson-title lesson-canceled">${prefix} <span style="text-decoration: line-through;">Stunda</span> - Atcelts ${timeHtml}</div>`;
+            } else {
+                html += `<div class="lesson-title">${prefix} ${esc(lesson.classJournalName)} ${timeHtml}${isNow ? '<span class="now-tag">tagad</span>' : ''}</div>`;
+                html += '<div class="lesson-body">';
+                (lesson.homeTasks || []).forEach(hw => {
+                    const hwText = stripHtml(hw.task.text);
+                    const atts = hw.task.attachments || [];
+                    if (!hwText && atts.length === 0) return;
+                    html += `<div class="hw-box"><strong style="color: var(--ek-gold);">Mājasdarbs:</strong> <span class="pre-line">${esc(hwText)}</span>`;
+                    atts.forEach(att => { html += `<div style="margin-top: 6px; color: var(--ek-link); cursor:pointer;" class="att-link" data-id="${esc(att.id)}" data-name="${esc(att.name)}">📎 ${esc(att.name)} <span style="opacity:0.6; font-size:0.85em;">(${Math.round((att.sizeInBytes || 0) / 1024)} KB)</span></div>`; });
+                    html += `</div>`;
+                });
+                (lesson.scheduledTests || []).forEach(test => { html += `<div class="test-box pre-line">⚠️ <strong>Darbs:</strong> ${esc(stripHtml(test.description.text))}</div>`; });
+                (lesson.lessonSubjects || []).forEach(subj => { if (!subj.isDraft) html += `<div class="pre-line" style="color: var(--ek-dim); margin-top: 6px;">📖 ${esc(stripHtml(subj.value.text))}</div>`; });
+                (lesson.thirdPartyEvents || []).forEach(ev => { if (!ev.isDeleted) html += `<div style="margin-top: 6px;">🔗 <a href="${esc(safeUrl(BASE_URL + ev.url))}" target="_blank" rel="noopener noreferrer" style="color: var(--ek-link); text-decoration: none;">${esc(ev.name)}</a></div>`; });
+                html += '</div>';
+            }
+            html += `</li>`;
+        });
+        html += `</ul></div>`;
+        content.innerHTML = html;
+        wireAttLinks(content);
+        applyLessonCollapse();
+    }
+})();
